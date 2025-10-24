@@ -11,12 +11,37 @@ import pandas as pd
 import numpy as np
 import chardet
 
+# ML / NLP libs
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+from sklearn.cluster import KMeans, AgglomerativeClustering
+from sklearn.metrics import silhouette_score
+
+try:
+    import hdbscan
+except Exception:
+    hdbscan = None
+
+try:
+    import networkx as nx
+    from community import community_louvain  # python-louvain
+except Exception:
+    nx = None
+    community_louvain = None
+
+# Embeddings
+try:
+    from sentence_transformers import SentenceTransformer
+except Exception:
+    SentenceTransformer = None
+
+# PolyFuzz (string matcher)
 try:
     from polyfuzz import PolyFuzz
-except Exception as e:
+except Exception:
     PolyFuzz = None
 
-st.set_page_config(page_title="Keyword Clustering (PolyFuzz)", page_icon="🔎", layout="wide")
+st.set_page_config(page_title="Keyword Clustering (SEO)", page_icon="🔎", layout="wide")
 
 # -----------------------------
 # Config dataclasses
@@ -32,23 +57,36 @@ class IntentConfig:
 
 @dataclass
 class ClusterConfig:
-    model: str = "TF-IDF"
-    min_similarity: float = 0.75   # interactive view
-    batch_thresholds: Tuple[float, ...] = (0.6, 0.7, 0.8)  # multi-batch
-    parent_strategy: str = "Highest metric"  # or Cluster representative/Longest/Shortest
-    parent_metric_col: Optional[str] = None  # used when parent_strategy == "Highest metric"
+    # Representation
+    representation: str = "SBERT (MiniLM)"
+    sbert_model: str = "sentence-transformers/all-MiniLM-L6-v2"
+    # Algorithm
+    algorithm: str = "HDBSCAN"  # KMeans, Agglomerative, HDBSCAN, Graph (Louvain), PolyFuzz
+    # Common options
+    batch_thresholds: Tuple[float, ...] = (0.6, 0.7, 0.8)  # for PolyFuzz
+    k: int = 20  # KMeans clusters
+    distance_threshold: float = 0.25  # Agglomerative (cosine distance)
+    hdb_min_cluster_size: int = 5
+    hdb_min_samples: Optional[int] = None
+    graph_sim_cutoff: float = 0.70
+    # Labeling
+    parent_strategy: str = "Highest metric"  # Highest metric / Centroid keyword / TF-IDF phrase / Longest / Shortest / Representative
+    parent_metric_col: Optional[str] = None
+    tfidf_top_k: int = 2
+    # Columns
     keyword_col_candidates: Tuple[str, ...] = ("Keyword", "Query", "Search term")
     url_col_candidates: Tuple[str, ...] = ("URL", "Page", "Page URL", "Landing Page", "Final URL")
-    impressions_col_candidates: Tuple[str, ...] = ("Impressions", "Clicks", "Sessions", "Pageviews")
-    volume_col_candidates: Tuple[str, ...] = ("Search Volume", "Volume", "SV")
+    impressions_col_candidates: Tuple[str, ...] = ("Impressions", "Clicks", "Sessions", "Pageviews", "Volume", "Search Volume")
     intent: IntentConfig = field(default_factory=IntentConfig)
-    cluster_url_strategy: str = "From parent row"  # or Most frequent URL / Highest metric URL
+    # URL controls
     cluster_separately_by_url: bool = False
+    max_keywords_per_url: Optional[int] = None  # per-bucket cap
 
 # -----------------------------
 # Utils
 # -----------------------------
 def detect_encoding_from_bytes(b: bytes) -> str:
+    import chardet
     res = chardet.detect(b)
     return res.get("encoding") or "utf-8"
 
@@ -79,9 +117,9 @@ def _find_first(df: pd.DataFrame, candidates: Tuple[str, ...]) -> Optional[str]:
 def detect_columns(df: pd.DataFrame, cfg: ClusterConfig) -> Dict[str, Optional[str]]:
     key_col = _find_first(df, cfg.keyword_col_candidates)
     url_col = _find_first(df, cfg.url_col_candidates)
-    imp_col = _find_first(df, cfg.impressions_col_candidates)
-    vol_col = _find_first(df, cfg.volume_col_candidates)
-    return {"keyword": key_col, "url": url_col, "impressions": imp_col, "volume": vol_col}
+    # Prefer a metric column if present
+    metric_col = _find_first(df, cfg.impressions_col_candidates)
+    return {"keyword": key_col, "url": url_col, "metric": metric_col}
 
 def normalize_keywords(s: pd.Series) -> pd.Series:
     return (s.astype(str)
@@ -89,188 +127,193 @@ def normalize_keywords(s: pd.Series) -> pd.Series:
               .str.replace(r"\s+", " ", regex=True)
               .str.lower())
 
+# -----------------------------
+# Representations
+# -----------------------------
+@st.cache_resource(show_spinner=False)
+def load_sbert(model_name: str):
+    if SentenceTransformer is None:
+        raise ImportError("sentence-transformers is required. Add to requirements and reinstall.")
+    return SentenceTransformer(model_name)
+
 @st.cache_data(show_spinner=False)
-def cluster_keywords_cached(keywords: List[str], model_name: str) -> pd.DataFrame:
+def embed_texts(texts: List[str], model_name: str) -> np.ndarray:
+    model = load_sbert(model_name)
+    return model.encode(texts, normalize_embeddings=True, show_progress_bar=False)
+
+def vectorize_tfidf(texts: List[str]) -> np.ndarray:
+    vec = TfidfVectorizer(ngram_range=(1,2), min_df=1)
+    return vec.fit_transform(texts).toarray()
+
+# -----------------------------
+# Algorithms
+# -----------------------------
+def algo_kmeans(X: np.ndarray, k: int):
+    km = KMeans(n_clusters=k, n_init="auto", random_state=42)
+    labels = km.fit_predict(X)
+    score = silhouette_score(X, labels) if len(set(labels)) > 1 else -1
+    return labels, {"silhouette": float(score)}
+
+def algo_agglomerative(X: np.ndarray, distance_threshold: float):
+    model = AgglomerativeClustering(
+        n_clusters=None, affinity="cosine", linkage="average",
+        distance_threshold=distance_threshold
+    )
+    labels = model.fit_predict(X)
+    return labels, {}
+
+def algo_hdbscan(X: np.ndarray, min_cluster_size: int, min_samples: Optional[int]):
+    if hdbscan is None:
+        raise ImportError("hdbscan is required. Add to requirements and reinstall.")
+    cl = hdbscan.HDBSCAN(
+        metric="euclidean",  # embeddings are normalized
+        min_cluster_size=min_cluster_size,
+        min_samples=min_samples,
+        cluster_selection_epsilon=0.0
+    )
+    labels = cl.fit_predict(X)
+    meta = {"noise": int(np.sum(labels == -1))}
+    return labels, meta
+
+def algo_graph_louvain(X: np.ndarray, sim_cutoff: float):
+    if nx is None or community_louvain is None:
+        raise ImportError("networkx and python-louvain are required. Add to requirements.")
+    sims = cosine_similarity(X)
+    np.fill_diagonal(sims, 0.0)
+    rows, cols = np.where(sims >= sim_cutoff)
+    G = nx.Graph()
+    G.add_nodes_from(range(X.shape[0]))
+    G.add_edges_from((int(i), int(j), {"weight": float(sims[i,j])}) for i,j in zip(rows, cols) if i<j)
+    if G.number_of_edges() == 0:
+        return np.arange(X.shape[0]), {"note": "no edges at cutoff"}
+    parts = community_louvain.best_partition(G, weight="weight", random_state=42)
+    labels = np.array([parts[i] for i in range(X.shape[0])], dtype=int)
+    return labels, {}
+
+# PolyFuzz: leave as separate “batch similarity” pathway (string matching)
+@st.cache_data(show_spinner=False)
+def polyfuzz_match(keywords: List[str], model_name: str = "TF-IDF") -> pd.DataFrame:
     if PolyFuzz is None:
-        raise ImportError("polyfuzz is required. Install with: pip install 'polyfuzz[fast]'")
+        raise ImportError("polyfuzz is required. Add to requirements and reinstall.")
     model = PolyFuzz(model_name)
     model.match(keywords, keywords)
-    matches = model.get_matches()
-    df = matches.rename(columns={"From": "keyword", "To": "cluster_repr", "Similarity": "similarity"})
-    return df
+    m = model.get_matches().rename(columns={"From":"keyword","To":"cluster_repr","Similarity":"similarity"})
+    return m
 
-def choose_parent(df_group: pd.DataFrame, strategy: str, metric_col: Optional[str]) -> str:
-    if strategy == "Highest metric" and metric_col in df_group.columns:
-        # Pick the keyword with the highest metric
-        ser = pd.to_numeric(df_group[metric_col], errors="coerce").fillna(0)
-        return df_group.loc[ser.idxmax(), "keyword"]
-    elif strategy == "Longest keyword":
-        return df_group.loc[df_group["keyword"].str.len().idxmax(), "keyword"]
-    elif strategy == "Shortest keyword":
-        return df_group.loc[df_group["keyword"].str.len().idxmin(), "keyword"]
+# -----------------------------
+# Labeling
+# -----------------------------
+def label_by_centroid(keywords: List[str], X: np.ndarray, labels: np.ndarray) -> Dict[int, str]:
+    out = {}
+    for lbl in np.unique(labels):
+        idx = np.where(labels == lbl)[0]
+        centroid = X[idx].mean(axis=0, keepdims=True)
+        sims = (X[idx] @ centroid.T).ravel()
+        out[int(lbl)] = keywords[idx[np.argmax(sims)]]
+    return out
+
+def label_by_tfidf_phrase(keywords: List[str], labels: np.ndarray, top_k: int=2) -> Dict[int, str]:
+    out = {}
+    for lbl in np.unique(labels):
+        idx = np.where(labels == lbl)[0]
+        texts = [keywords[i] for i in idx]
+        vec = TfidfVectorizer(ngram_range=(1,2), stop_words="english").fit(texts)
+        tf = vec.transform(texts).sum(axis=0).A1
+        terms = np.array(vec.get_feature_names_out())
+        top = terms[tf.argsort()[::-1][:top_k]]
+        out[int(lbl)] = " ".join(top)
+    return out
+
+def label_by_metric(df: pd.DataFrame, labels: np.ndarray, metric_col: Optional[str]) -> Dict[int, str]:
+    out = {}
+    for lbl in np.unique(labels):
+        idx = np.where(labels == lbl)[0]
+        if metric_col and metric_col in df.columns:
+            ser = pd.to_numeric(df.iloc[idx][metric_col], errors="coerce").fillna(0)
+            if ser.empty:
+                out[int(lbl)] = df.iloc[idx]["keyword"].iloc[0]
+            else:
+                out[int(lbl)] = df.iloc[idx].iloc[ser.idxmax()]["keyword"]
+        else:
+            out[int(lbl)] = df.iloc[idx]["keyword"].iloc[0]
+    return out
+
+# -----------------------------
+# Pipeline helpers
+# -----------------------------
+def stratified_cap_by_url(df: pd.DataFrame, url_col: Optional[str], cap: Optional[int]) -> pd.DataFrame:
+    if not url_col or cap is None:
+        return df
+    parts = []
+    for url, sub in df.groupby(url_col, dropna=False):
+        if len(sub) > cap:
+            parts.append(sub.sample(n=cap, random_state=42))
+        else:
+            parts.append(sub)
+    return pd.concat(parts, ignore_index=True)
+
+def build_representation(keywords: List[str], cfg: ClusterConfig) -> np.ndarray:
+    if cfg.representation == "TF-IDF":
+        return vectorize_tfidf(keywords)
+    elif cfg.representation.startswith("SBERT"):
+        model = cfg.sbert_model if "MiniLM" in cfg.representation else "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+        return embed_texts(keywords, model)
     else:
-        # Cluster representative (default/fallback)
-        # Use the most common cluster_repr string within group
-        return Counter(df_group["cluster_repr"]).most_common(1)[0][0]
+        return vectorize_tfidf(keywords)
 
-def assign_parent_names(df: pd.DataFrame, cols: Dict[str, Optional[str]], cfg: ClusterConfig) -> pd.DataFrame:
-    metric_col = cfg.parent_metric_col
-    if cfg.parent_strategy == "Highest metric" and not metric_col:
-        # auto-pick metric col (prefer Impressions, else Volume, else first numeric col)
-        for c in [cols.get("impressions"), cols.get("volume")]:
-            if c and c in df.columns:
-                metric_col = c
-                break
-        if not metric_col:
-            numeric_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c]) and c not in ["similarity"]]
-            metric_col = numeric_cols[0] if numeric_cols else None
-
-    # Compute parent per cluster_repr
-    parents = []
-    for cluster_id, sub in df.groupby("cluster_repr", sort=False):
-        parent = choose_parent(sub, cfg.parent_strategy, metric_col)
-        parents.append((cluster_id, parent))
-    parent_map = dict(parents)
-    df["parent"] = df["cluster_repr"].map(parent_map)
-    return df
-
-def add_intents(df: pd.DataFrame, cfg: IntentConfig, keyword_col: str = "keyword") -> pd.DataFrame:
-    intent = pd.Series(index=df.index, dtype="string")
-    kw = df[keyword_col].astype(str)
-    info_mask = kw.str.contains(cfg.info_pattern, case=False, regex=True, na=False)
-    nav_mask = kw.str.contains(cfg.nav_pattern, case=False, regex=True, na=False)
-    trans_mask = kw.str.contains(cfg.trans_pattern, case=False, regex=True, na=False)
-    intent[info_mask] = "Informational"
-    intent[nav_mask] = "Navigational"
-    intent[trans_mask] = "Transactional"
-    intent = intent.fillna("Unmapped")
-    df["intent"] = intent
-    return df
-
-def assign_cluster_url(df: pd.DataFrame, url_col: Optional[str], cfg: ClusterConfig) -> pd.DataFrame:
-    if not url_col or url_col not in df.columns:
-        return df  # nothing to do
-
-    cluster_urls = {}
-    for cluster_id, sub in df.groupby("parent", sort=False):
-        if cfg.cluster_url_strategy == "From parent row":
-            # find the row where keyword == parent
-            parent_row = sub.loc[sub["keyword"] == cluster_id]
-            if parent_row.empty:
-                parent_row = sub.loc[sub["keyword"] == sub["parent"]]
-            if parent_row.empty:
-                # fallback to most frequent
-                url = sub[url_col].mode().iloc[0] if not sub[url_col].isna().all() else None
-            else:
-                url = parent_row[url_col].iloc[0]
-        elif cfg.cluster_url_strategy == "Most frequent URL":
-            url = sub[url_col].mode().iloc[0] if not sub[url_col].isna().all() else None
-        else:  # Highest metric URL
-            # choose by metric if available
-            metric_col = cfg.parent_metric_col
-            if not metric_col or metric_col not in sub.columns:
-                metric_col = None
-                candidates = [c for c in sub.columns if pd.api.types.is_numeric_dtype(sub[c]) and c not in ["similarity"]]
-                if candidates:
-                    metric_col = candidates[0]
-            if metric_col:
-                ser = pd.to_numeric(sub[metric_col], errors="coerce").fillna(0)
-                url = sub.loc[ser.idxmax(), url_col]
-            else:
-                url = sub[url_col].mode().iloc[0] if not sub[url_col].isna().all() else None
-        cluster_urls[cluster_id] = url
-
-    df["cluster_url"] = df["parent"].map(cluster_urls)
-    return df
-
-def run_pipeline(df_in: pd.DataFrame, cfg: ClusterConfig, cols: Dict[str, Optional[str]]) -> pd.DataFrame:
-    # Prepare base
-    df = df_in.copy()
-    df.rename(columns={cols["keyword"]: "Keyword"}, inplace=True)
-    df["keyword"] = normalize_keywords(df["Keyword"])
-
-    # Cluster once and reuse for batches
-    clustered = cluster_keywords_cached(df["keyword"].tolist(), cfg.model)
-    merged = clustered.merge(df, on="keyword", how="left")
-
-    results = {}
-    thresholds = sorted(set([round(float(t), 2) for t in cfg.batch_thresholds if 0 <= float(t) <= 1]))
-    for thr in thresholds:
-        temp = merged[merged["similarity"] >= thr].copy()
-        temp = assign_parent_names(temp, cols, cfg)
-        temp = add_intents(temp, cfg.intent, keyword_col="keyword")
-        temp = assign_cluster_url(temp, cols.get("url"), cfg)
-
-        # Reorder columns
-        front_cols = ["keyword", "parent", "cluster_repr", "similarity", "intent", "cluster_url"]
-        # Ensure URL is present visibly
-        if cols.get("url") and cols["url"] in temp.columns and cols["url"] not in front_cols:
-            front_cols.append(cols["url"])
-        other_cols = [c for c in temp.columns if c not in front_cols]
-        final = temp[front_cols + other_cols].reset_index(drop=True)
-        results[thr] = final
-    return results
-
-def run_pipeline_grouped_by_url(df_in: pd.DataFrame, cfg: ClusterConfig, cols: Dict[str, Optional[str]]) -> pd.DataFrame:
-    url_col = cols.get("url")
-    if not url_col:
-        return run_pipeline(df_in, cfg, cols)
-
-    # Process each URL bucket separately and concat
-    outputs = {}
-    thresholds = sorted(set([round(float(t), 2) for t in cfg.batch_thresholds if 0 <= float(t) <= 1]))
-    for thr in thresholds:
-        parts = []
-        for url_val, sub in df_in.groupby(url_col, dropna=False):
-            cols_sub = cols.copy()
-            # sub-detect key column name still the same
-            res_thr = run_pipeline(sub, ClusterConfig(**{**cfg.__dict__, "batch_thresholds": (thr,)}), cols_sub)
-            parts.append(res_thr[thr])
-        outputs[thr] = pd.concat(parts, ignore_index=True)
-    return outputs
+def run_algo(X: np.ndarray, cfg: ClusterConfig):
+    if cfg.algorithm == "KMeans":
+        return algo_kmeans(X, cfg.k)
+    elif cfg.algorithm == "Agglomerative":
+        return algo_agglomerative(X, cfg.distance_threshold)
+    elif cfg.algorithm == "HDBSCAN":
+        return algo_hdbscan(X, cfg.hdb_min_cluster_size, cfg.hdb_min_samples)
+    elif cfg.algorithm == "Graph (Louvain)":
+        return algo_graph_louvain(X, cfg.graph_sim_cutoff)
+    else:
+        raise NotImplementedError
 
 # -----------------------------
 # UI
 # -----------------------------
-st.title("🔎 Keyword Clustering (PolyFuzz)")
-st.caption("Upload a CSV/XLSX containing a keyword column (e.g., *Keyword*, *Query*, or *Search term*). Optionally include a URL column to map keywords → URLs.")
+st.title("🔎 Keyword Clustering for SEO")
+st.caption("Semantic clustering with embeddings and classic methods. Map clusters to URLs and pick clear labels.")
 
 with st.sidebar:
-    st.header("Settings")
-    model = st.selectbox("Matching model", ["TF-IDF", "EditDistance"], index=0)
-    min_sim = st.slider("Interactive min similarity", 0.0, 1.0, 0.75, 0.01)
+    st.header("1) Data")
+    uploaded = st.file_uploader("Upload CSV/XLSX", type=["csv", "tsv", "xlsx", "xls"])
+    use_example = st.toggle("Use example data", value=False)
 
+    st.header("2) Representation")
+    representation = st.selectbox("Text representation", ["SBERT (MiniLM)", "SBERT (Multilingual)", "TF-IDF"], index=0)
+
+    st.header("3) Algorithm")
+    algorithm = st.selectbox("Clustering algorithm", ["HDBSCAN", "KMeans", "Agglomerative", "Graph (Louvain)", "PolyFuzz (string match batches)"], index=0)
+
+    st.header("4) URL-level controls")
+    cap_per_url = st.number_input("Max keywords per URL (cap per bucket)", min_value=1, max_value=10000, value=500)
+    cluster_by_url = st.toggle("Cluster separately per URL (bucket first)", value=False)
+
+    st.header("5) Labeling")
+    label_strategy = st.selectbox("Primary label shown", ["Highest metric", "Centroid keyword", "TF-IDF phrase", "Longest", "Shortest", "Representative"], index=0)
+    tfidf_top_k = st.slider("TF-IDF phrase words (n-grams)", 1, 4, 2)
+    st.caption("We also compute alternative labels and show them in extra columns.")
+
+    st.header("6) Algo parameters")
+    k_val = st.number_input("KMeans: k", min_value=2, max_value=200, value=20)
+    dist_thr = st.slider("Agglomerative: distance threshold (cosine)", 0.0, 1.5, 0.25, 0.01)
+    hdb_min_size = st.number_input("HDBSCAN: min cluster size", min_value=2, max_value=500, value=5)
+    hdb_min_samples = st.number_input("HDBSCAN: min samples (0 = auto)", min_value=0, max_value=500, value=0)
+    graph_cut = st.slider("Graph/Louvain: similarity cutoff", 0.0, 1.0, 0.70, 0.01)
+
+    st.header("7) PolyFuzz (if selected)")
     batch_str = st.text_input("Batch similarity thresholds (comma-separated)", "0.6,0.7,0.8")
-    try:
-        batch_thresholds = tuple(sorted(set(float(x.strip()) for x in batch_str.split(",") if x.strip() != "")))
-    except Exception:
-        batch_thresholds = (0.6, 0.7, 0.8)
-        st.warning("Could not parse thresholds. Using 0.6, 0.7, 0.8.")
 
     st.markdown("---")
-    st.subheader("Parent naming")
-    parent_strategy = st.selectbox("Strategy", ["Highest metric", "Cluster representative", "Longest keyword", "Shortest keyword"], index=0)
-    parent_metric_col_manual = st.text_input("Metric column (optional, auto-detected if blank)", "")
+    run_btn = st.button("🚀 Run clustering", type="primary", use_container_width=True)
 
-    st.markdown("---")
-    st.subheader("URL mapping")
-    cluster_url_strategy = st.selectbox("Cluster URL strategy", ["From parent row", "Most frequent URL", "Highest metric URL"], index=0)
-    cluster_separately_by_url = st.toggle("Cluster separately per URL (bucket by URL first)", value=False)
-
-    st.markdown("---")
-    st.subheader("Intent Regex (optional)")
-    info_pat = st.text_area("Informational pattern", IntentConfig().info_pattern, height=80)
-    nav_pat = st.text_area("Navigational pattern", IntentConfig().nav_pattern, height=60)
-    trans_pat = st.text_area("Transactional pattern", IntentConfig().trans_pattern, height=60)
-
-    st.markdown("---")
-    st.caption("Tip: Multi-batch lets you compare different similarity cuts side-by-side.")
-
-uploaded = st.file_uploader("Upload CSV/XLSX", type=["csv", "tsv", "xlsx", "xls"])
-
-example = st.toggle("Use example data (overrides upload)", value=False)
-if example:
-    uploaded = None
+# Load data
+if use_example:
     df_in = pd.DataFrame({
         "Keyword": ["best running shoes", "buy running shoes", "what are trail shoes",
                     "nike pegasus review", "asics gel-kayano price", "trail runners vs hiking shoes",
@@ -279,7 +322,7 @@ if example:
         "URL": [" /shoes/best " , "/shoes/buy", "/shoes/trail", "/shoes/pegasus", "/shoes/gel-kayano",
                 "/shoes/trail", "/shoes/ultraboost", "/guides/sizing", "/shoes/brooks-ghost", "/stores/near-me"]
     })
-    st.info("Using built-in example dataset.")
+    st.info("Using example data.")
 elif uploaded is not None:
     try:
         df_in = read_table_from_upload(uploaded)
@@ -293,68 +336,214 @@ if df_in is not None:
     st.subheader("Preview input")
     st.dataframe(df_in.head(20), use_container_width=True)
 
-    # Detect columns
-    cfg_probe = ClusterConfig()
-    cols = detect_columns(df_in, cfg_probe)
-
-    # Let user override detected URL or keyword column if needed
-    with st.expander("Column detection & overrides"):
-        st.write("Detected columns:", cols)
-        key_override = st.selectbox("Keyword column", options=list(df_in.columns), index=list(df_in.columns).index(cols["keyword"]) if cols["keyword"] in df_in.columns else 0)
+    # Detect columns and override controls
+    cols_detect = detect_columns(df_in, ClusterConfig())
+    with st.expander("Column detection & overrides", expanded=False):
+        st.write("Detected:", cols_detect)
+        key_col = st.selectbox("Keyword column", options=list(df_in.columns), index=list(df_in.columns).index(cols_detect["keyword"]) if cols_detect["keyword"] in df_in.columns else 0)
         url_options = ["<None>"] + list(df_in.columns)
-        url_default_idx = url_options.index(cols["url"]) if cols["url"] in url_options else 0
-        url_override = st.selectbox("URL column (optional)", options=url_options, index=url_default_idx)
-        cols["keyword"] = key_override
-        cols["url"] = None if url_override == "<None>" else url_override
+        url_default_idx = url_options.index(cols_detect["url"]) if cols_detect["url"] in url_options else 0
+        url_col_sel = st.selectbox("URL column (optional)", options=url_options, index=url_default_idx)
+        metric_candidates = [c for c in df_in.columns if pd.api.types.is_numeric_dtype(df_in[c])]
+        metric_col = st.selectbox("Metric column (for Highest metric labeling)", options=["<Auto>"] + metric_candidates, index=0)
 
-        # Pick metric column from numeric columns
-        numeric_candidates = [c for c in df_in.columns if pd.api.types.is_numeric_dtype(df_in[c])]
-        metric_sel = st.selectbox("Metric column for parent/URL 'highest metric' logic", options=["<Auto>"] + numeric_candidates, index=0)
-        metric_col_final = None if metric_sel == "<Auto>" else metric_sel
+    # Normalize and cap per URL
+    df_work = df_in.copy()
+    df_work.rename(columns={key_col: "Keyword"}, inplace=True)
+    df_work["keyword"] = normalize_keywords(df_work["Keyword"])
+    url_col_final = None if url_col_sel == "<None>" else url_col_sel
+    if url_col_final and url_col_final in df_work.columns:
+        df_work[url_col_final] = df_work[url_col_final].astype(str).str.strip()
+    # Apply per-URL cap
+    df_work = stratified_cap_by_url(df_work, url_col_final, cap_per_url)
 
+    st.markdown("**Rows after per-URL cap:** {}".format(len(df_work)))
+
+    # Build cfg
     cfg = ClusterConfig(
-        model=model,
-        min_similarity=min_sim,
-        batch_thresholds=batch_thresholds,
-        parent_strategy=parent_strategy,
-        parent_metric_col=parent_metric_col_manual.strip() or metric_col_final,
-        intent=IntentConfig(info_pattern=info_pat, nav_pattern=nav_pat, trans_pattern=trans_pat),
-        cluster_url_strategy=cluster_url_strategy,
-        cluster_separately_by_url=cluster_separately_by_url
+        representation=representation,
+        algorithm="PolyFuzz" if algorithm.startswith("PolyFuzz") else algorithm,
+        batch_thresholds=tuple(sorted(set(float(x.strip()) for x in batch_str.split(",") if x.strip()))),
+        k=int(k_val),
+        distance_threshold=float(dist_thr),
+        hdb_min_cluster_size=int(hdb_min_size),
+        hdb_min_samples=None if int(hdb_min_samples)==0 else int(hdb_min_samples),
+        graph_sim_cutoff=float(graph_cut),
+        parent_strategy=label_strategy,
+        parent_metric_col=None if metric_col=="<Auto>" else metric_col,
+        tfidf_top_k=int(tfidf_top_k),
+        cluster_separately_by_url=bool(cluster_by_url),
+        max_keywords_per_url=int(cap_per_url)
     )
 
-    run = st.button("🚀 Run clustering", type="primary", use_container_width=True)
-    if run:
-        with st.spinner("Clustering keywords..."):
-            try:
-                if cfg.cluster_separately_by_url:
-                    results = run_pipeline_grouped_by_url(df_in, cfg, cols)
+    if run_btn:
+        with st.spinner("Clustering..."):
+            if cfg.algorithm == "PolyFuzz":
+                # PolyFuzz batch path (string matching with thresholds)
+                matches = polyfuzz_match(df_work["keyword"].tolist(), "TF-IDF")
+                # Merge back
+                merged = matches.merge(df_work, on="keyword", how="left")
+                # Tabs per threshold
+                thresholds = sorted(cfg.batch_thresholds)
+                tabs = st.tabs([f"PolyFuzz ≥ {t:.2f}" for t in thresholds])
+                for tab, thr in zip(tabs, thresholds):
+                    with tab:
+                        temp = merged[merged["similarity"] >= thr].copy()
+                        # Parent naming: representative by default
+                        temp["parent_representative"] = temp["cluster_repr"]
+                        # Fallback metric parent
+                        metric_c = cfg.parent_metric_col or cols_detect["metric"]
+                        temp["_lbl"] = temp["cluster_repr"].astype("category").cat.codes
+                        labels_metric = label_by_metric(temp.assign(keyword=temp["keyword"]), temp["_lbl"].values, metric_c)
+                        temp["label_metric"] = temp["_lbl"].map(labels_metric)
+                        # Final chosen label
+                        label_col_to_use = "label_metric" if cfg.parent_strategy == "Highest metric" else "parent_representative"
+                        temp["parent"] = temp[label_col_to_use]
+                        # URL view
+                        if url_col_final and url_col_final in temp.columns:
+                            # canonical URL = URL of parent row when available, else mode
+                            canon = {}
+                            for p, sub in temp.groupby("parent", sort=False):
+                                row = sub.loc[sub["keyword"] == p]
+                                if row.empty:
+                                    u = sub[url_col_final].mode().iloc[0] if not sub[url_col_final].isna().all() else None
+                                else:
+                                    u = row[url_col_final].iloc[0]
+                                canon[p] = u
+                            temp["cluster_url"] = temp["parent"].map(canon)
+
+                        # Insights
+                        n_clusters = temp["parent"].nunique()
+                        sizes = temp.groupby("parent")["keyword"].count().sort_values(ascending=False)
+                        st.markdown(f"**Clusters:** {n_clusters} • **Avg size:** {sizes.mean():.2f} • **Median size:** {sizes.median():.0f}")
+                        st.dataframe(temp.head(500), use_container_width=True)
+                        st.markdown("**Top clusters by size**")
+                        st.dataframe(sizes.head(20).to_frame("count"))
+
+                        csv = temp.to_csv(index=False).encode("utf-8")
+                        st.download_button(f"⬇️ Download CSV (≥ {thr:.2f})", data=csv, file_name=f"keywords_clustered_polyfuzz_{thr:.2f}.csv", mime="text/csv")
+            else:
+                # Embedding/Vector path
+                # Optionally cluster per URL bucket
+                def cluster_block(block: pd.DataFrame):
+                    keywords = block["keyword"].tolist()
+                    # Vectorize
+                    X = build_representation(keywords, cfg)
+                    # Cluster
+                    labels, meta = run_algo(X, cfg)
+                    # Build frame
+                    out = block.copy()
+                    out["_label"] = labels
+                    # Label strategies
+                    metric_c = cfg.parent_metric_col or cols_detect["metric"]
+                    label_metric = label_by_metric(out, labels, metric_c)
+                    label_centroid = label_by_centroid(keywords, X, labels)
+                    label_tfidf = label_by_tfidf_phrase(keywords, labels, top_k=cfg.tfidf_top_k)
+                    # Longest/Shortest/Representative
+                    label_long = {}
+                    label_short = {}
+                    label_repr = {}
+                    for lbl in np.unique(labels):
+                        idx = np.where(labels==lbl)[0]
+                        kws = np.array(keywords)[idx]
+                        if len(kws)==0:
+                            continue
+                        lengths = np.array([len(k) for k in kws])
+                        label_long[int(lbl)] = kws[int(np.argmax(lengths))]
+                        label_short[int(lbl)] = kws[int(np.argmin(lengths))]
+                        # representative ~ centroid
+                        label_repr[int(lbl)] = label_centroid[int(lbl)]
+                    # Choose primary
+                    def pick(lbl: int) -> str:
+                        if cfg.parent_strategy == "Highest metric":
+                            return label_metric.get(int(lbl))
+                        elif cfg.parent_strategy == "Centroid keyword":
+                            return label_centroid.get(int(lbl))
+                        elif cfg.parent_strategy == "TF-IDF phrase":
+                            return label_tfidf.get(int(lbl))
+                        elif cfg.parent_strategy == "Longest":
+                            return label_long.get(int(lbl))
+                        elif cfg.parent_strategy == "Shortest":
+                            return label_short.get(int(lbl))
+                        else:
+                            return label_repr.get(int(lbl))
+                    out["label_metric"] = out["_label"].map(label_metric)
+                    out["label_centroid"] = out["_label"].map(label_centroid)
+                    out["label_tfidf"] = out["_label"].map(label_tfidf)
+                    out["label_longest"] = out["_label"].map(label_long)
+                    out["label_shortest"] = out["_label"].map(label_short)
+                    out["label_representative"] = out["_label"].map(label_repr)
+                    out["parent"] = out["_label"].map(lambda x: pick(int(x)))
+                    # URL canon
+                    if url_col_final and url_col_final in out.columns:
+                        canon = {}
+                        for p, sub in out.groupby("parent", sort=False):
+                            row = sub.loc[sub["keyword"] == p]
+                            if row.empty:
+                                u = sub[url_col_final].mode().iloc[0] if not sub[url_col_final].isna().all() else None
+                            else:
+                                u = row[url_col_final].iloc[0]
+                            canon[p] = u
+                        out["cluster_url"] = out["parent"].map(canon)
+                    # Insights
+                    n_clusters = out["_label"].nunique()
+                    sizes = out.groupby("parent")["keyword"].count().sort_values(ascending=False)
+                    insights = {
+                        "clusters": int(n_clusters),
+                        "avg_size": float(sizes.mean()) if len(sizes)>0 else 0.0,
+                        "median_size": float(sizes.median()) if len(sizes)>0 else 0.0
+                    }
+                    insights.update(meta)
+                    return out, insights
+
+                outputs = []
+                insights_list = []
+                if cfg.cluster_separately_by_url and url_col_final:
+                    for url_val, sub in df_work.groupby(url_col_final, dropna=False):
+                        res, ins = cluster_block(sub)
+                        outputs.append(res)
+                        ins["url_bucket"] = str(url_val)
+                        insights_list.append(ins)
+                    df_out = pd.concat(outputs, ignore_index=True)
+                    st.info("Clustered separately in each URL bucket.")
                 else:
-                    results = run_pipeline(df_in, cfg, cols)
-            except Exception as e:
-                st.error(f"Pipeline failed: {e}")
-                st.stop()
+                    df_out, ins = cluster_block(df_work)
+                    df_out["url_bucket"] = df_out[url_col_final] if url_col_final in df_out.columns else None
+                    insights_list = [ins]
 
-        st.success("Done! Browse results per threshold below.")
-        tabs = st.tabs([f"≥ {thr:.2f}" for thr in results.keys()])
-        for tab, (thr, df_out) in zip(tabs, results.items()):
-            with tab:
-                st.markdown(f"**Rows:** {len(df_out):,}")
-                st.dataframe(df_out.head(500), use_container_width=True)
+                st.subheader("Label display")
+                display_label = st.radio("Choose which label column to display as 'Core cluster label'",
+                                         ["parent", "label_metric", "label_centroid", "label_tfidf", "label_longest", "label_shortest", "label_representative"],
+                                         horizontal=True, index=0)
+                df_view = df_out.copy()
+                df_view["core_label"] = df_view[display_label]
 
-                # Intent distribution
-                st.markdown("#### Intent distribution")
-                intent_counts = df_out["intent"].value_counts(dropna=False).reset_index()
-                intent_counts.columns = ["intent", "count"]
-                st.dataframe(intent_counts, use_container_width=True)
+                # Insights
+                total_clusters = df_view["core_label"].nunique()
+                cluster_sizes = df_view.groupby("core_label")["keyword"].count().sort_values(ascending=False)
+                noise = next((i["noise"] for i in insights_list if "noise" in i), 0)
+                extra = []
+                if cfg.algorithm == "KMeans":
+                    extra.append(f"silhouette: {insights_list[0].get('silhouette', 'n/a'):.3f}")
+                if cfg.algorithm == "HDBSCAN":
+                    extra.append(f"noise: {noise}")
+                st.markdown(f"**Clusters:** {total_clusters} • **Avg size:** {cluster_sizes.mean():.2f} • **Median size:** {cluster_sizes.median():.0f} " + ("• " + " • ".join(extra) if extra else ""))
 
-                # Top clusters by size
-                st.markdown("#### Top clusters (by size)")
-                cluster_sizes = df_out.groupby("parent")["keyword"].count().sort_values(ascending=False).head(20)
-                st.dataframe(cluster_sizes.to_frame("count"), use_container_width=True)
+                cols_show = ["keyword", "core_label", "_label"]
+                if url_col_final:
+                    cols_show.append(url_col_final)
+                cols_show += ["cluster_url", "label_metric", "label_centroid", "label_tfidf"]
+                if cfg.parent_metric_col:
+                    cols_show.append(cfg.parent_metric_col)
+                df_show = df_view[ [c for c in cols_show if c in df_view.columns] ].copy()
+                st.dataframe(df_show.head(1000), use_container_width=True)
+
+                st.markdown("**Top clusters by size (core label)**")
+                st.dataframe(cluster_sizes.head(25).to_frame("count"))
 
                 # Download
-                csv = df_out.to_csv(index=False).encode("utf-8")
-                st.download_button(f"⬇️ Download CSV (≥ {thr:.2f})", data=csv, file_name=f"keywords_clustered_{thr:.2f}.csv", mime="text/csv")
+                csv = df_view.to_csv(index=False).encode("utf-8")
+                st.download_button("⬇️ Download CSV", data=csv, file_name=f"keywords_clustered_{cfg.algorithm.lower()}.csv", mime="text/csv")
+
 st.markdown("---")
-st.caption("Built with Streamlit + PolyFuzz.")
+st.caption("Built for SEO: embeddings, multiple algorithms, URL-aware controls, and clear cluster labeling.")
