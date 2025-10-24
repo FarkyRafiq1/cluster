@@ -1,4 +1,3 @@
-
 # app.py
 import io
 from collections import Counter
@@ -86,7 +85,6 @@ class ClusterConfig:
 # Utils
 # -----------------------------
 def detect_encoding_from_bytes(b: bytes) -> str:
-    import chardet
     res = chardet.detect(b)
     return res.get("encoding") or "utf-8"
 
@@ -155,8 +153,9 @@ def algo_kmeans(X: np.ndarray, k: int):
     return labels, {"silhouette": float(score)}
 
 def algo_agglomerative(X: np.ndarray, distance_threshold: float):
+    # Use 'metric' instead of deprecated 'affinity'
     model = AgglomerativeClustering(
-        n_clusters=None, affinity="cosine", linkage="average",
+        n_clusters=None, metric="cosine", linkage="average",
         distance_threshold=distance_threshold
     )
     labels = model.fit_predict(X)
@@ -207,6 +206,8 @@ def label_by_centroid(keywords: List[str], X: np.ndarray, labels: np.ndarray) ->
     out = {}
     for lbl in np.unique(labels):
         idx = np.where(labels == lbl)[0]
+        if len(idx) == 0:
+            continue
         centroid = X[idx].mean(axis=0, keepdims=True)
         sims = (X[idx] @ centroid.T).ravel()
         out[int(lbl)] = keywords[idx[np.argmax(sims)]]
@@ -216,6 +217,8 @@ def label_by_tfidf_phrase(keywords: List[str], labels: np.ndarray, top_k: int=2)
     out = {}
     for lbl in np.unique(labels):
         idx = np.where(labels == lbl)[0]
+        if len(idx) == 0:
+            continue
         texts = [keywords[i] for i in idx]
         vec = TfidfVectorizer(ngram_range=(1,2), stop_words="english").fit(texts)
         tf = vec.transform(texts).sum(axis=0).A1
@@ -225,17 +228,27 @@ def label_by_tfidf_phrase(keywords: List[str], labels: np.ndarray, top_k: int=2)
     return out
 
 def label_by_metric(df: pd.DataFrame, labels: np.ndarray, metric_col: Optional[str]) -> Dict[int, str]:
-    out = {}
+    """
+    Pick the parent keyword per cluster by the highest value in `metric_col`.
+    Falls back to the first keyword if the metric column is missing/empty.
+    Uses a position-safe argmax to avoid index misalignment.
+    """
+    out: Dict[int, str] = {}
     for lbl in np.unique(labels):
         idx = np.where(labels == lbl)[0]
-        if metric_col and metric_col in df.columns:
-            ser = pd.to_numeric(df.iloc[idx][metric_col], errors="coerce").fillna(0)
-            if ser.empty:
-                out[int(lbl)] = df.iloc[idx]["keyword"].iloc[0]
+        if len(idx) == 0:
+            continue  # empty cluster edge-case
+
+        sub = df.iloc[idx]  # subset frame
+        if metric_col and metric_col in sub.columns:
+            ser = pd.to_numeric(sub[metric_col], errors="coerce").fillna(0)
+            if ser.size == 0:
+                out[int(lbl)] = sub["keyword"].iloc[0]
             else:
-                out[int(lbl)] = df.iloc[idx].iloc[ser.idxmax()]["keyword"]
+                pos = int(np.nanargmax(ser.to_numpy()))  # positional argmax within subset
+                out[int(lbl)] = sub["keyword"].iloc[pos]
         else:
-            out[int(lbl)] = df.iloc[idx]["keyword"].iloc[0]
+            out[int(lbl)] = sub["keyword"].iloc[0]
     return out
 
 # -----------------------------
@@ -451,7 +464,6 @@ if df_in is not None:
                         lengths = np.array([len(k) for k in kws])
                         label_long[int(lbl)] = kws[int(np.argmax(lengths))]
                         label_short[int(lbl)] = kws[int(np.argmin(lengths))]
-                        # representative ~ centroid
                         label_repr[int(lbl)] = label_centroid[int(lbl)]
                     # Choose primary
                     def pick(lbl: int) -> str:
