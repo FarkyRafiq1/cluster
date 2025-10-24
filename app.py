@@ -1,6 +1,5 @@
 
 import io
-import re
 import json
 from dataclasses import dataclass, field
 from typing import Optional, Tuple, Dict, List
@@ -39,6 +38,49 @@ except Exception:
     PolyFuzz = None
 
 st.set_page_config(page_title="Keyword Clustering (SEO)", page_icon="🔎", layout="wide")
+
+# -----------------------------
+# Friendly naming maps
+# -----------------------------
+FRIENDLY_LABELS = {
+    "label_metric": "Top Keyword by Performance",
+    "label_centroid": "Central Topic Keyword",
+    "label_tfidf": "Descriptive Topic Name",
+    "label_longest": "Detailed / Long-Tail Term",
+    "label_shortest": "Broad / Head Term",
+    "label_representative": "Representative Keyword",
+    "parent": "Primary Cluster Label",
+    "cluster_url": "Canonical Page (Ranked URL)",
+    "url_bucket": "Original URL Group",
+    "core_label": "Displayed Cluster Name",
+    "_label": "Cluster ID (Internal)",
+    "keyword": "Keyword",
+}
+
+LABEL_DISPLAY_OPTIONS = {
+    "parent": "Primary Cluster Label",
+    "label_metric": "Top Keyword by Performance",
+    "label_centroid": "Central Topic Keyword",
+    "label_tfidf": "Descriptive Topic Name",
+    "label_longest": "Detailed / Long-Tail Term",
+    "label_shortest": "Broad / Head Term",
+    "label_representative": "Representative Keyword",
+}
+
+ALGO_FRIENDLY = {
+    "HDBSCAN": "Smart Auto Clustering (Density-Based)",
+    "KMeans": "Fixed Number of Topics (Set K)",
+    "Agglomerative": "Hierarchical Topics (Auto-Merge by Similarity)",
+    "Graph (Louvain)": "Semantic Communities (Network Clusters)",
+    "PolyFuzz (string match batches)": "Text Similarity (Surface-Level Matches)",
+}
+ALGO_HELP = {
+    "HDBSCAN": "Finds natural dense groups and marks outliers as noise. Great for organic topic discovery.",
+    "KMeans": "You set k clusters for neat topic buckets. Fast and predictable for planning.",
+    "Agglomerative": "Builds a hierarchy by merging similar items. Good for pillar → subtopic structures.",
+    "Graph (Louvain)": "Finds communities in a similarity network. Great for internal linking and topical maps.",
+    "PolyFuzz (string match batches)": "Groups near-duplicate phrases by surface similarity. Ideal for cleanup/dedup.",
+}
 
 # --- persistent override state ---
 if "overrides" not in st.session_state:
@@ -118,25 +160,16 @@ def _try_read_csv(bytes_buf: bytes, *, encoding: str, sep, engine, on_bad_lines,
 
 def read_table_from_upload(f, *, delimiter_opt="Auto (detect)", quotechar='"', bad_line_behavior="error",
                            use_python_engine=True, header_row="Infer", skip_rows=0, thousands="", decimal=".") -> pd.DataFrame:
-    """
-    Flexible reader:
-    - Auto detects encoding (chardet)
-    - Auto/sniff delimiter; fallbacks through comma, tab, semicolon, pipe
-    - Can skip/warn bad lines
-    - Lets you pick header inference and row skipping
-    """
     name = f.name.lower()
     content = f.read()
     encoding = detect_encoding_from_bytes(content)
 
-    header = "infer" if header_row == "Infer" else (int(header_row) if isinstance(header_row, int) else 0)
+    header = "infer" if header_row == "Infer" else 0
     on_bad = None if bad_line_behavior == "error" else bad_line_behavior
 
     if name.endswith((".xlsx", ".xls")):
         return pd.read_excel(io.BytesIO(content))
 
-    # CSV/TSV and unknown
-    # Map delimiter
     sep_map = {
         "Auto (detect)": None,
         ",": ",",
@@ -145,14 +178,7 @@ def read_table_from_upload(f, *, delimiter_opt="Auto (detect)", quotechar='"', b
         "|": "|"
     }
     sep = sep_map.get(delimiter_opt, None)
-    # Try candidates in order
-    candidates = []
-    if sep is None:
-        candidates = [None, ",", "\t", ";", "|"]
-    else:
-        candidates = [sep]
-
-    # engine choice
+    candidates = [sep] if sep is not None else [None, ",", "\t", ";", "|"]
     engines = ["python"] if (use_python_engine or sep is None) else ["c", "python"]
 
     last_err = None
@@ -165,7 +191,6 @@ def read_table_from_upload(f, *, delimiter_opt="Auto (detect)", quotechar='"', b
                 last_err = e
                 continue
 
-    # Final fallback: force python engine + autodetect + warn on bad lines
     try:
         return _try_read_csv(content, encoding=encoding, sep=None, engine="python", on_bad_lines="warn",
                              quotechar=quotechar, header=header, skiprows=skip_rows, thousands=thousands, decimal=decimal)
@@ -179,17 +204,14 @@ def _find_first(df: pd.DataFrame, candidates: Tuple[str, ...]) -> Optional[str]:
     if df is None or df.empty:
         return None
     lower_map = {c.lower(): c for c in df.columns}
-    # exact lowercase match
     for cand in candidates:
         lc = cand.lower()
         if lc in lower_map:
             return lower_map[lc]
-    # contains match
     for cand in candidates:
         for c in df.columns:
             if cand.lower() in c.lower():
                 return c
-    # heuristic: keyword-like: shortest text-ish column
     text_cols = [c for c in df.columns if pd.api.types.is_string_dtype(df[c])]
     if text_cols:
         return text_cols[0]
@@ -198,15 +220,12 @@ def _find_first(df: pd.DataFrame, candidates: Tuple[str, ...]) -> Optional[str]:
 def detect_columns(df: pd.DataFrame, cfg: ClusterConfig) -> Dict[str, Optional[str]]:
     key_col = _find_first(df, cfg.keyword_col_candidates)
     url_col = _find_first(df, cfg.url_col_candidates)
-    # Prefer a numeric metric if present; otherwise first candidate
     metric_col = None
-    # first: candidate list overlap that is numeric
     for c in df.columns:
         if any(tok.lower() in c.lower() for tok in cfg.impressions_col_candidates):
             if pd.api.types.is_numeric_dtype(df[c]):
                 metric_col = c
                 break
-    # fallback: any numeric column
     if metric_col is None:
         for c in df.columns:
             if pd.api.types.is_numeric_dtype(df[c]):
@@ -290,7 +309,7 @@ def polyfuzz_match(keywords: List[str], model_name: str = "TF-IDF") -> pd.DataFr
     return m
 
 # -----------------------------
-# Labeling
+# Labeling helpers
 # -----------------------------
 def label_by_centroid(keywords: List[str], X: np.ndarray, labels: np.ndarray) -> Dict[int, str]:
     out = {}
@@ -318,11 +337,6 @@ def label_by_tfidf_phrase(keywords: List[str], labels: np.ndarray, top_k: int=2)
     return out
 
 def label_by_metric(df: pd.DataFrame, labels: np.ndarray, metric_col: Optional[str]) -> Dict[int, str]:
-    """
-    Pick the parent keyword per cluster by the highest value in `metric_col`.
-    Falls back to the first keyword if the metric column is missing/empty.
-    Uses a position-safe argmax to avoid index misalignment.
-    """
     out: Dict[int, str] = {}
     for lbl in np.unique(labels):
         idx = np.where(labels == lbl)[0]
@@ -345,7 +359,6 @@ def label_by_metric(df: pd.DataFrame, labels: np.ndarray, metric_col: Optional[s
 # Pipeline helpers
 # -----------------------------
 def stratified_cap_by_url(df: pd.DataFrame, url_col: Optional[str], cap: Optional[int]) -> pd.DataFrame:
-    # Robust guards
     if df is None or df.empty:
         return df
     if not url_col or url_col not in df.columns or cap is None:
@@ -356,7 +369,6 @@ def stratified_cap_by_url(df: pd.DataFrame, url_col: Optional[str], cap: Optiona
         return df
     if cap <= 0:
         return df
-
     parts = []
     try:
         for url, sub in df.groupby(url_col, dropna=False):
@@ -405,7 +417,7 @@ def suggest_k(n_rows: int, desired_size: int) -> int:
 # UI
 # -----------------------------
 st.title("🔎 Keyword Clustering for SEO")
-st.caption("Robust CSV import • Flexible column mapping • Embeddings & classic clustering • URL-aware controls • Cluster Manager")
+st.caption("Friendly names in UI & CSV • Robust import • Embeddings & classic clustering • URL-aware controls • Cluster Manager")
 
 with st.sidebar:
     st.header("1) Data")
@@ -413,24 +425,30 @@ with st.sidebar:
     use_example = st.toggle("Use example data", value=False)
 
     st.header("2) Parsing options")
-    delimiter_opt = st.selectbox("Delimiter", ["Auto (detect)", ",", "\\t", ";", "|"], index=0)
+    delimiter_opt = st.selectbox("Delimiter", ["Auto (detect)", ",", "\\t", ";", "|"], index=0, help="Auto usually works. Switch if your file uses a specific delimiter.")
     quotechar = st.text_input("Quote character", '"')
-    bad_line_behavior = st.selectbox("If malformed rows:", ["error", "skip", "warn"], index=0)
-    use_python_engine = st.toggle("Use Python engine (more forgiving)", value=True)
+    bad_line_behavior = st.selectbox("If malformed rows:", ["error", "skip", "warn"], index=0, help="Skip/warn can help with messy CSVs.")
+    use_python_engine = st.toggle("Use Python engine (more forgiving)", value=True, help="More tolerant to irregular rows, slightly slower.")
     header_row = st.selectbox("Header row", ["Infer", "0 (first row is header)"], index=0)
     skip_rows = st.number_input("Skip top rows", min_value=0, max_value=10000, value=0)
     thousands = st.text_input("Thousands separator (optional)", "")
     decimal = st.text_input("Decimal separator (default .)", ".")
 
     st.header("3) Representation")
-    representation = st.selectbox("Text representation", ["SBERT (MiniLM)", "SBERT (Multilingual)", "TF-IDF"], index=0)
+    representation = st.selectbox("Text representation", ["SBERT (MiniLM)", "SBERT (Multilingual)", "TF-IDF"], index=0,
+                                  help="SBERT = better semantics; TF-IDF = faster/shallower lexical similarity.")
 
     st.header("4) Algorithm")
-    algorithm = st.selectbox("Clustering algorithm", ["HDBSCAN", "KMeans", "Agglomerative", "Graph (Louvain)", "PolyFuzz (string match batches)"], index=0)
+    friendly_algo_options = [ALGO_FRIENDLY[k] for k in ALGO_FRIENDLY.keys()]
+    friendly_choice = st.selectbox("Clustering approach", friendly_algo_options, index=0)
+    # Map back to internal key
+    algo_map = {v: k for k, v in ALGO_FRIENDLY.items()}
+    algorithm_choice = algo_map[friendly_choice]
+    st.caption(ALGO_HELP[algorithm_choice])
 
     st.header("5) URL-level controls")
     cap_per_url = st.number_input("Max keywords per URL (cap per bucket)", min_value=1, max_value=100000, value=500)
-    cluster_by_url = st.toggle("Cluster separately per URL (bucket first)", value=False)
+    cluster_by_url = st.toggle("Cluster separately per URL (bucket first)", value=False, help="Group by URL first, then cluster inside each bucket.")
 
     st.header("6) Labeling")
     label_strategy = st.selectbox("Primary label shown", ["Highest metric", "Centroid keyword", "TF-IDF phrase", "Longest", "Shortest", "Representative"], index=0)
@@ -488,16 +506,14 @@ if df_in is not None:
     cols_detect = detect_columns(df_in, ClusterConfig())
     with st.expander("Column mapping", expanded=False):
         st.write("Detected:", cols_detect)
-        # Keyword
-        key_col = st.selectbox("Keyword column", options=list(df_in.columns), index=(list(df_in.columns).index(cols_detect["keyword"]) if cols_detect["keyword"] in df_in.columns else 0))
-        # URL
+        key_col = st.selectbox("Keyword column", options=list(df_in.columns),
+                               index=(list(df_in.columns).index(cols_detect["keyword"]) if cols_detect["keyword"] in df_in.columns else 0))
         url_options = ["<None>"] + list(df_in.columns)
         url_default_idx = url_options.index(cols_detect["url"]) if (cols_detect["url"] in url_options) else 0
         url_col_sel = st.selectbox("URL column (optional)", options=url_options, index=url_default_idx)
-        # Metric
         numeric_cols = [c for c in df_in.columns if pd.api.types.is_numeric_dtype(df_in[c])]
         metric_candidates = ["<Auto>"] + numeric_cols + [c for c in df_in.columns if c not in numeric_cols]
-        metric_col = st.selectbox("Metric column (for Highest metric labeling)", options=metric_candidates, index=0)
+        metric_col = st.selectbox("Metric column (for 'Top Keyword by Performance')", options=metric_candidates, index=0)
 
     # Normalize and cap per URL
     df_work = df_in.copy()
@@ -519,14 +535,13 @@ if df_in is not None:
     st.markdown(f"**Rows after per-URL cap:** {len(df_work):,} (from {n_before:,})")
 
     # KMeans suggestion
-    if algorithm == "KMeans":
+    if algorithm_choice == "KMeans":
         st.caption(f"Suggested k ≈ {suggest_k(len(df_work), int(desired_avg))} (you set k={k_val})")
 
     # Build cfg
     cfg = ClusterConfig(
         representation=representation,
-        algorithm="PolyFuzz" if algorithm.startswith("PolyFuzz") else algorithm,
-        batch_thresholds=tuple(sorted(set(float(x.strip()) for x in str(','.join([str(x) for x in ([] if isinstance(getattr(ClusterConfig, 'batch_thresholds', ()), str) else [])])) if x.strip()))),
+        algorithm="PolyFuzz" if algorithm_choice.startswith("PolyFuzz") else algorithm_choice,
         k=int(k_val),
         distance_threshold=float(dist_thr),
         hdb_min_cluster_size=int(hdb_min_size),
@@ -538,11 +553,11 @@ if df_in is not None:
         cluster_separately_by_url=bool(cluster_by_url),
         max_keywords_per_url=int(cap_per_url)
     )
-    # Fix batch_thresholds to what user typed in earlier sidebar (can't reuse earlier code block here)
-    # We'll parse a simple text input for thresholds for PolyFuzz; since we lost it above, we set a default here.
-    # Add a small input for thresholds here too for safety:
-    if algorithm.startswith("PolyFuzz"):
-        poly_thr_text = st.text_input("PolyFuzz thresholds (comma-separated)", "0.6,0.7,0.8", key="poly_thr_in_block")
+
+    # PolyFuzz thresholds input
+    poly_thr_text = None
+    if algorithm_choice.startswith("PolyFuzz"):
+        poly_thr_text = st.text_input("PolyFuzz thresholds (comma-separated)", "0.6,0.7,0.8")
         try:
             cfg.batch_thresholds = tuple(sorted({float(x.strip()) for x in poly_thr_text.split(",") if x.strip()}))
         except Exception:
@@ -565,7 +580,6 @@ if df_in is not None:
                         temp["label_metric"] = temp["_lbl"].map(labels_metric)
                         label_col_to_use = "label_metric" if cfg.parent_strategy == "Highest metric" else "parent_representative"
                         temp["parent"] = temp[label_col_to_use]
-                        # URL canon
                         if url_col_final and url_col_final in temp.columns:
                             canon = {}
                             for p, sub in temp.groupby("parent", sort=False):
@@ -580,11 +594,14 @@ if df_in is not None:
                         n_clusters = temp["parent"].nunique()
                         sizes = temp.groupby("parent")["keyword"].count().sort_values(ascending=False)
                         st.markdown(f"**Clusters:** {n_clusters} • **Avg size:** {sizes.mean():.2f} • **Median size:** {sizes.median():.0f}")
-                        st.dataframe(temp.head(500), use_container_width=True)
+                        temp_friendly = temp.rename(columns=FRIENDLY_LABELS)
+                        st.dataframe(temp_friendly.head(500), use_container_width=True)
                         st.markdown("**Top clusters by size**")
                         st.dataframe(sizes.head(20).to_frame("count"))
 
-                        csv = temp.to_csv(index=False).encode("utf-8")
+                        use_friendly_csv = st.toggle("Use friendly headers in CSV", value=True, key=f"pf_csv_{thr}")
+                        export_df = temp.rename(columns=FRIENDLY_LABELS) if use_friendly_csv else temp
+                        csv = export_df.to_csv(index=False).encode("utf-8")
                         st.download_button(f"⬇️ Download CSV (≥ {thr:.2f})", data=csv, file_name=f"keywords_clustered_polyfuzz_{thr:.2f}.csv", mime="text/csv")
             else:
                 # Embedding/Vector path
@@ -674,12 +691,18 @@ if df_in is not None:
                     df_out["url_bucket"] = df_out[url_col_final] if (url_col_final and url_col_final in df_out.columns) else None
                     insights_list = [ins]
 
+                # Friendly label display chooser
                 st.subheader("Label display")
-                display_label = st.radio("Choose which label column to display as 'Core cluster label'",
-                                         ["parent", "label_metric", "label_centroid", "label_tfidf", "label_longest", "label_shortest", "label_representative"],
-                                         horizontal=True, index=0)
+                friendly_options = [f"{v}" for v in LABEL_DISPLAY_OPTIONS.values()]
+                default_index = 0  # Primary Cluster Label
+                friendly_choice_label = st.radio("Choose which label to show as the cluster name",
+                                                 friendly_options, horizontal=True, index=default_index)
+                # Map back to internal column
+                inv_map = {v: k for k, v in LABEL_DISPLAY_OPTIONS.items()}
+                display_internal_col = inv_map[friendly_choice_label]
+
                 df_view = df_out.copy()
-                df_view["core_label"] = df_view[display_label]
+                df_view["core_label"] = df_view[display_internal_col]
 
                 # Insights
                 total_clusters = df_view["core_label"].nunique()
@@ -702,7 +725,7 @@ if df_in is not None:
                     except Exception as e:
                         st.caption(f"(UMAP unavailable or failed: {e})")
 
-                # --- Cluster Manager ---
+                # --- Cluster Manager (overrides) ---
                 st.subheader("🧰 Cluster Manager")
 
                 with st.expander("Rename / merge clusters"):
@@ -777,7 +800,8 @@ if df_in is not None:
 
                 df_over = apply_overrides(df_view, core_col="core_label")
                 st.markdown("**After overrides (preview)**")
-                st.dataframe(df_over.head(1000), use_container_width=True)
+                df_over_display = df_over.rename(columns=FRIENDLY_LABELS)
+                st.dataframe(df_over_display.head(1000), use_container_width=True)
 
                 # Recompute top cluster sizes after overrides
                 cluster_sizes_over = df_over.groupby("core_label")["keyword"].count().sort_values(ascending=False)
@@ -796,19 +820,22 @@ if df_in is not None:
                     except Exception as e:
                         st.error(f"Failed to load overrides: {e}")
 
-                # Downloads
+                # Downloads with friendly headers option
+                use_friendly_csv = st.toggle("Use friendly headers in CSV", value=True)
                 cols_show = ["keyword", "core_label", "_label"]
                 if url_col_final:
                     cols_show.append(url_col_final)
                 cols_show += ["cluster_url", "label_metric", "label_centroid", "label_tfidf"]
                 if cfg.parent_metric_col:
                     cols_show.append(cfg.parent_metric_col)
-                df_show = df_over[[c for c in cols_show if c in df_over.columns]].copy()
-                st.markdown("**Table (post-overrides)**")
-                st.dataframe(df_show.head(1000), use_container_width=True)
+                df_export = df_over[[c for c in cols_show if c in df_over.columns]].copy()
+                if use_friendly_csv:
+                    df_export = df_export.rename(columns=FRIENDLY_LABELS)
+                st.markdown("**Table (export preview)**")
+                st.dataframe(df_export.head(1000), use_container_width=True)
 
-                csv_final = df_over.to_csv(index=False).encode("utf-8")
-                st.download_button("⬇️ Download CSV (post-overrides)", data=csv_final, file_name=f"keywords_clustered_{cfg.algorithm.lower()}_overrides.csv", mime="text/csv")
+                csv_final = df_export.to_csv(index=False).encode("utf-8")
+                st.download_button("⬇️ Download CSV", data=csv_final, file_name=f"keywords_clustered_{cfg.algorithm.lower()}_friendly.csv", mime="text/csv")
 
 st.markdown("---")
-st.caption("Built by Farky SEO: robust import, flexible mapping, embeddings & classic algorithms, URL-aware controls, Cluster Manager.")
+st.caption("Built by Farky Rafiq | Plumbworld SEO: friendly names, robust import, multiple algorithms, URL-aware clustering, and human-in-the-loop controls.")
