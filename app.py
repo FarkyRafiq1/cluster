@@ -9,7 +9,6 @@ import chardet
 
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.cluster import AgglomerativeClustering
-from sklearn.metrics.pairwise import cosine_similarity
 
 try:
     from sentence_transformers import SentenceTransformer
@@ -24,6 +23,8 @@ FRIENDLY_LABELS = {
     "cluster_url": "Cluster URL",
     "url_bucket": "URL Bucket",
     "keyword": "Keyword (normalized)",
+    "cluster_total_volume": "Cluster Total Volume",
+    "cluster_avg_difficulty": "Cluster Avg Difficulty",
 }
 
 COLUMN_NORMALIZATION_MAP = {
@@ -37,10 +38,10 @@ COLUMN_NORMALIZATION_MAP = {
     "page": "URL",
     "query": "Keyword",
     "Top queries": "Keyword",
-    "Impressions": "Volume",
-    "Clicks": "Traffic",
+    "Impressions": "Impressions",
+    "Clicks": "Clicks",
     "Search term": "Keyword",
-    "Impr.": "Volume",
+    "Impr.": "Impressions",
 }
 
 def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -116,7 +117,7 @@ def label_by_centroid(keywords: List[str], X: np.ndarray, labels: np.ndarray) ->
     return out
 
 st.title("🧩 Simple Keyword Grouper")
-st.caption("Straightforward grouping & clustering by URL or keywords. Minimal options for consistent results.")
+st.caption("Group by URL or cluster keywords. Optional cluster totals & averages with dropdown-selected metrics.")
 
 with st.sidebar:
     st.header("1) Data")
@@ -151,7 +152,9 @@ if use_example:
                     "nike pegasus review", "asics gel-kayano price", "trail runners vs hiking shoes",
                     "adidas ultraboost sale", "running shoe size guide", "brooks ghost 15", "shoe store near me"],
         "URL": ["/shoes/best", "/shoes/buy", "/shoes/trail", "/shoes/pegasus", "/shoes/gel-kayano",
-                "/shoes/trail", "/shoes/ultraboost", "/guides/sizing", "/shoes/brooks-ghost", "/stores/near-me"]
+                "/shoes/trail", "/shoes/ultraboost", "/guides/sizing", "/shoes/brooks-ghost", "/stores/near-me"],
+        "Volume": [12000, 9000, 4000, 3000, 2500, 1500, 8000, 2000, 1800, 10000],
+        "Difficulty": [55, 50, 35, 65, 60, 40, 45, 30, 50, 25]
     })
     st.info("Using example data.")
 elif upl is not None:
@@ -169,20 +172,41 @@ if df is not None:
     st.subheader("Preview")
     st.dataframe(df.head(20), use_container_width=True)
 
+    # Column mapping (minimal)
     with st.expander("Column mapping (optional)", expanded=False):
         cols = list(df.columns)
         key_col = st.selectbox("Keyword column", options=cols, index=(cols.index("Keyword") if "Keyword" in cols else 0))
         url_col = st.selectbox("URL column (optional)", options=["<None>"] + cols,
                                index=(["<None>"] + cols).index("URL") if "URL" in cols else 0)
 
+    # Metrics dropdowns (flexible, based on provided data)
+    with st.sidebar:
+        st.header("4) Metrics (optional)")
+        cols_all = ["<None>"] + list(df.columns)
+        # Heuristics for defaults
+        vol_default = "<None>"
+        for cand in ["Volume", "Search Volume", "Impressions", "Traffic", "Clicks"]:
+            if cand in df.columns:
+                vol_default = cand
+                break
+        diff_default = "<None>"
+        for cand in ["Difficulty", "KD", "Keyword Difficulty"]:
+            if cand in df.columns:
+                diff_default = cand
+                break
+
+        vol_col = st.selectbox("Volume / Proxy (sum per cluster)", options=cols_all, index=cols_all.index(vol_default))
+        diff_col = st.selectbox("Difficulty (avg per cluster)", options=cols_all, index=cols_all.index(diff_default))
+
+    # Standardize keyword column + normalized keyword
     df_work = df.copy()
     if key_col not in df_work.columns:
         st.error("Selected Keyword column not found.")
         st.stop()
     df_work.rename(columns={key_col: "Keyword"}, inplace=True)
-    df_work["keyword"] = df_work["Keyword"].astype(str)
-    df_work["keyword"] = df_work["keyword"].str.strip().str.replace(r"\s+", " ", regex=True).str.lower()
+    df_work["keyword"] = df_work["Keyword"].astype(str).str.strip().str.replace(r"\s+", " ", regex=True).str.lower()
 
+    # Determine URL handling
     url_col_final = None if url_col == "<None>" else url_col
     if mode == "Group by existing URL column (cluster within each URL)":
         if not url_col_final or url_col_final not in df_work.columns:
@@ -193,19 +217,38 @@ if df is not None:
     else:
         url_col_final = None
 
+    # ---------- RUN ----------
     if run_btn:
         if mode == "Group by existing URL column (cluster within each URL)" and (not url_col_final or url_col_final not in df_work.columns):
             st.error("URL column required for this mode.")
             st.stop()
 
-        def cluster_block(block: pd.DataFrame) -> pd.DataFrame:
+        def vectorize_block(block: pd.DataFrame) -> np.ndarray:
             texts = block["keyword"].tolist()
-            X = vectorize(texts, use_embeddings=use_embeddings)
-            labels = cluster_texts(X, distance_threshold=float(dist_thr))
-            lbl2name = label_by_centroid(texts, X, labels)
+            try:
+                return vectorize(texts, use_embeddings=use_embeddings)
+            except Exception:
+                return vectorize(texts, use_embeddings=False)
+
+        def cluster_block(block: pd.DataFrame) -> pd.DataFrame:
+            X = vectorize_block(block)
+            model = AgglomerativeClustering(n_clusters=None, metric="cosine", linkage="average", distance_threshold=float(dist_thr))
+            labels = model.fit_predict(X)
+            # label by centroid over TF-IDF space
+            # recompute vector space to get centroid similarity (ensures consistency)
+            X_for_label = vectorize(block["keyword"].tolist(), use_embeddings=False)
+            # centroid representative
             out = block.copy()
             out["_label"] = labels
-            out["parent"] = out["_label"].map(lbl2name)
+            reps = {}
+            for lbl in np.unique(labels):
+                idx = np.where(labels == lbl)[0]
+                if len(idx) == 0:
+                    continue
+                centroid = X_for_label[idx].mean(axis=0, keepdims=True)
+                sims = (X_for_label[idx] @ centroid.T).ravel()
+                reps[int(lbl)] = block["keyword"].iloc[idx[int(np.argmax(sims))]]
+            out["parent"] = out["_label"].map(reps)
             return out
 
         if mode == "Group by existing URL column (cluster within each URL)" and url_col_final:
@@ -228,21 +271,45 @@ if df is not None:
                 df_out["cluster_url"] = None
                 df_out["url_bucket"] = None
 
+        # ---- Cluster-level metrics (dropdown driven) ----
+        def safe_num(s):
+            return pd.to_numeric(s, errors="coerce")
+
+        # Compute cluster totals/averages if selected
+        if vol_col and vol_col != "<None>" and vol_col in df_out.columns:
+            vol_series = safe_num(df_out[vol_col]).fillna(0.0)
+            cluster_total_volume = vol_series.groupby(df_out["parent"]).sum()
+            df_out["cluster_total_volume"] = df_out["parent"].map(cluster_total_volume)
+        else:
+            df_out["cluster_total_volume"] = np.nan
+
+        if diff_col and diff_col != "<None>" and diff_col in df_out.columns:
+            diff_series = safe_num(df_out[diff_col])
+            cluster_avg_difficulty = diff_series.groupby(df_out["parent"]).mean()
+            df_out["cluster_avg_difficulty"] = df_out["parent"].map(cluster_avg_difficulty)
+        else:
+            df_out["cluster_avg_difficulty"] = np.nan
+
+        # ---- Output preview (place metrics beside label) ----
         st.subheader("Results")
         preview = df_out.copy()
         if "Keyword" in preview.columns and "keyword" in preview.columns:
             preview = preview.drop(columns=["Keyword"])
+        # Rename friendly
         preview = preview.rename(columns=FRIENDLY_LABELS)
+        # Order columns with metrics adjacent to Cluster Label
+        ordered = ["Keyword (normalized)", "Cluster Label", "Cluster Total Volume", "Cluster Avg Difficulty",
+                   "Cluster URL", "URL Bucket", "Cluster ID"]
+        # Keep existing + ordered intersection first
+        cols_existing = [c for c in ordered if c in preview.columns] + [c for c in preview.columns if c not in ordered]
+        preview = preview[cols_existing]
         preview = preview.loc[:, ~preview.columns.duplicated()]
         st.dataframe(preview.head(1000), use_container_width=True)
 
-        export_cols = ["keyword", "parent", "_label", "cluster_url", "url_bucket"]
-        export_cols = [c for c in export_cols if c in df_out.columns]
-        export_df = df_out[export_cols + (["Keyword"] if "Keyword" in df_out.columns else [])].copy()
-        export_df = export_df.rename(columns=FRIENDLY_LABELS)
-        export_df = export_df.loc[:, ~export_df.columns.duplicated()]
+        # Export CSV
+        export_df = preview.copy()
         csv = export_df.to_csv(index=False).encode("utf-8")
-        st.download_button("⬇️ Download CSV", data=csv, file_name="keywords_grouped.csv", mime="text/csv")
+        st.download_button("⬇️ Download CSV", data=csv, file_name="keywords_grouped_with_metrics.csv", mime="text/csv")
 
 st.markdown("---")
-st.caption("For consistent results, leave embeddings OFF (TF-IDF) and use the default threshold (0.25).")
+st.caption("Tip: If your dataset lacks Volume, pick Impressions or Clicks as the volume proxy. Difficulty can be KD/Keyword Difficulty.")
