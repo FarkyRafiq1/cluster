@@ -54,7 +54,8 @@ FRIENDLY_LABELS = {
     "url_bucket": "Original URL Group",
     "core_label": "Displayed Cluster Name",
     "_label": "Cluster ID (Internal)",
-    "keyword": "Keyword",
+    # IMPORTANT: avoid collision with raw "Keyword" by providing unique friendly name
+    "keyword": "Keyword (normalized)",
 }
 
 LABEL_DISPLAY_OPTIONS = {
@@ -90,6 +91,37 @@ if "overrides" not in st.session_state:
         "must_link": [],     # [(kw1, kw2), ...]
         "cannot_link": [],   # [(kw1, kw2), ...]
     }
+
+# -----------------------------
+# Column normalization (your mapping)
+# -----------------------------
+COLUMN_NORMALIZATION_MAP = {
+    "Current position": "Position",
+    "Current URL": "URL",
+    "Current URL inside": "Page URL inside",
+    "Current traffic": "Traffic",
+    "KD": "Difficulty",
+    "Keyword Difficulty": "Difficulty",
+    "Search Volume": "Volume",
+    "page": "URL",
+    "query": "Keyword",
+    "Top queries": "Keyword",
+    "Impressions": "Volume",
+    "Clicks": "Traffic",
+    "Search term": "Keyword",
+    "Impr.": "Volume",
+}
+
+def normalize_column_names(df: pd.DataFrame) -> pd.DataFrame:
+    # Trim & squash whitespace in headers for stability
+    df = df.copy()
+    df.columns = df.columns.astype(str).str.strip().str.replace(r"\s+", " ", regex=True)
+    # Apply normalization map
+    df.rename(columns=COLUMN_NORMALIZATION_MAP, inplace=True)
+    # If duplicates appear after renaming, keep first occurrence
+    if df.columns.duplicated().any():
+        df = df.loc[:, ~df.columns.duplicated()]
+    return df
 
 # -----------------------------
 # Config dataclasses
@@ -498,6 +530,9 @@ else:
     df_in = None
 
 if df_in is not None:
+    # Apply your column normalization immediately after load
+    df_in = normalize_column_names(df_in)
+
     st.subheader("Preview input")
     st.dataframe(df_in.head(20), use_container_width=True)
     st.caption(f"Columns detected: {list(df_in.columns)}")
@@ -506,11 +541,14 @@ if df_in is not None:
     cols_detect = detect_columns(df_in, ClusterConfig())
     with st.expander("Column mapping", expanded=False):
         st.write("Detected:", cols_detect)
+        # Keyword
         key_col = st.selectbox("Keyword column", options=list(df_in.columns),
                                index=(list(df_in.columns).index(cols_detect["keyword"]) if cols_detect["keyword"] in df_in.columns else 0))
+        # URL
         url_options = ["<None>"] + list(df_in.columns)
         url_default_idx = url_options.index(cols_detect["url"]) if (cols_detect["url"] in url_options) else 0
         url_col_sel = st.selectbox("URL column (optional)", options=url_options, index=url_default_idx)
+        # Metric
         numeric_cols = [c for c in df_in.columns if pd.api.types.is_numeric_dtype(df_in[c])]
         metric_candidates = ["<Auto>"] + numeric_cols + [c for c in df_in.columns if c not in numeric_cols]
         metric_col = st.selectbox("Metric column (for 'Top Keyword by Performance')", options=metric_candidates, index=0)
@@ -600,7 +638,12 @@ if df_in is not None:
                         st.dataframe(sizes.head(20).to_frame("count"))
 
                         use_friendly_csv = st.toggle("Use friendly headers in CSV", value=True, key=f"pf_csv_{thr}")
-                        export_df = temp.rename(columns=FRIENDLY_LABELS) if use_friendly_csv else temp
+                        export_df = temp.copy()
+                        # Avoid duplicate "Keyword" vs "keyword" collisions in export
+                        if "Keyword" in export_df.columns and "keyword" in export_df.columns:
+                            export_df = export_df.drop(columns=["Keyword"])
+                        export_df = export_df.rename(columns=FRIENDLY_LABELS) if use_friendly_csv else export_df
+                        export_df = export_df.loc[:, ~export_df.columns.duplicated()]
                         csv = export_df.to_csv(index=False).encode("utf-8")
                         st.download_button(f"⬇️ Download CSV (≥ {thr:.2f})", data=csv, file_name=f"keywords_clustered_polyfuzz_{thr:.2f}.csv", mime="text/csv")
             else:
@@ -800,7 +843,13 @@ if df_in is not None:
 
                 df_over = apply_overrides(df_view, core_col="core_label")
                 st.markdown("**After overrides (preview)**")
-                df_over_display = df_over.rename(columns=FRIENDLY_LABELS)
+                # ----- FIX DUPLICATE COLUMN NAMES DURING DISPLAY -----
+                df_over_display = df_over.copy()
+                # Drop raw "Keyword" to avoid collision with "keyword" -> "Keyword (normalized)"
+                if "Keyword" in df_over_display.columns and "keyword" in df_over_display.columns:
+                    df_over_display = df_over_display.drop(columns=["Keyword"])
+                df_over_display = df_over_display.rename(columns=FRIENDLY_LABELS)
+                df_over_display = df_over_display.loc[:, ~df_over_display.columns.duplicated()]
                 st.dataframe(df_over_display.head(1000), use_container_width=True)
 
                 # Recompute top cluster sizes after overrides
@@ -829,8 +878,12 @@ if df_in is not None:
                 if cfg.parent_metric_col:
                     cols_show.append(cfg.parent_metric_col)
                 df_export = df_over[[c for c in cols_show if c in df_over.columns]].copy()
+                # Drop raw "Keyword" if present to avoid collision with "keyword"
+                if "Keyword" in df_export.columns and "keyword" in df_export.columns:
+                    df_export = df_export.drop(columns=["Keyword"])
                 if use_friendly_csv:
                     df_export = df_export.rename(columns=FRIENDLY_LABELS)
+                df_export = df_export.loc[:, ~df_export.columns.duplicated()]
                 st.markdown("**Table (export preview)**")
                 st.dataframe(df_export.head(1000), use_container_width=True)
 
@@ -838,4 +891,4 @@ if df_in is not None:
                 st.download_button("⬇️ Download CSV", data=csv_final, file_name=f"keywords_clustered_{cfg.algorithm.lower()}_friendly.csv", mime="text/csv")
 
 st.markdown("---")
-st.caption("Built by Farky Rafiq | Plumbworld SEO: friendly names, robust import, multiple algorithms, URL-aware clustering, and human-in-the-loop controls.")
+st.caption("Built for SEO: friendly names, robust import (+column normalization), multiple algorithms, URL-aware clustering, and human-in-the-loop controls.")
