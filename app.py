@@ -726,6 +726,90 @@ if df_in is not None:
                         st.caption(f"(UMAP unavailable or failed: {e})")
 
                 # --- Cluster Manager (overrides) ---
+
+# Apply overrides live
+def apply_overrides(df: pd.DataFrame, core_col: str = "core_label") -> pd.DataFrame:
+    ov = st.session_state.overrides
+    out = df.copy()
+
+    if ov["rename"]:
+        out[core_col] = out[core_col].replace(ov["rename"])
+
+    if ov["move"]:
+        mask = out["keyword"].isin(ov["move"].keys())
+        out.loc[mask, core_col] = out.loc[mask, "keyword"].map(ov["move"])
+
+    for a, b in ov["must_link"]:
+        if a in set(out["keyword"]) and b in set(out["keyword"]):
+            la = out.loc[out["keyword"] == a, core_col].iloc[0]
+            lb = out.loc[out["keyword"] == b, core_col].iloc[0]
+            size_a = (out[core_col] == la).sum()
+            size_b = (out[core_col] == lb).sum()
+            target = la if size_a >= size_b else lb
+            out.loc[out["keyword"].isin([a, b]), core_col] = target
+
+    for a, b in ov["cannot_link"]:
+        if a in set(out["keyword"]) and b in set(out["keyword"]):
+            la = out.loc[out["keyword"] == a, core_col].iloc[0]
+            lb = out.loc[out["keyword"] == b, core_col].iloc[0]
+            if la == lb:
+                new_label = f"{lb} (split)"
+                out.loc[out["keyword"] == b, core_col] = new_label
+
+    return out
+
+
+# ✅ Correct placement of preview and dedup fix
+df_over = apply_overrides(df_view, core_col="core_label")
+st.markdown("**After overrides (preview)**")
+
+df_over_display = df_over.rename(columns=FRIENDLY_LABELS)
+df_over_display.columns = pd.io.parsers.ParserBase({'names': df_over_display.columns})._maybe_dedup_names(df_over_display.columns)
+
+st.dataframe(df_over_display.head(1000), use_container_width=True)
+
+# Recompute top cluster sizes after overrides
+cluster_sizes_over = df_over.groupby("core_label")["keyword"].count().sort_values(ascending=False)
+st.markdown("**Top clusters by size (after overrides)**")
+st.dataframe(cluster_sizes_over.head(25).to_frame("count"))
+
+# Export / import overrides
+ov_json = json.dumps(st.session_state.overrides, ensure_ascii=False, indent=2)
+st.download_button("⬇️ Download overrides.json", data=ov_json, file_name="overrides.json", mime="application/json")
+
+uploaded_ov = st.file_uploader("Upload overrides.json", type=["json"], key="ov_json")
+if uploaded_ov:
+    try:
+        st.session_state.overrides = json.loads(uploaded_ov.read().decode("utf-8"))
+        st.success("Overrides loaded.")
+    except Exception as e:
+        st.error(f"Failed to load overrides: {e}")
+
+# Downloads with friendly headers option
+use_friendly_csv = st.toggle("Use friendly headers in CSV", value=True)
+cols_show = ["keyword", "core_label", "_label"]
+if url_col_final:
+    cols_show.append(url_col_final)
+cols_show += ["cluster_url", "label_metric", "label_centroid", "label_tfidf"]
+if cfg.parent_metric_col:
+    cols_show.append(cfg.parent_metric_col)
+
+df_export = df_over[[c for c in cols_show if c in df_over.columns]].copy()
+if use_friendly_csv:
+    df_export = df_export.rename(columns=FRIENDLY_LABELS)
+
+st.markdown("**Table (export preview)**")
+st.dataframe(df_export.head(1000), use_container_width=True)
+
+csv_final = df_export.to_csv(index=False).encode("utf-8")
+st.download_button(
+    "⬇️ Download CSV",
+    data=csv_final,
+    file_name=f"keywords_clustered_{cfg.algorithm.lower()}_friendly.csv",
+    mime="text/csv"
+)
+
+                
                 st.subheader("🧰 Cluster Manager")
 
                 with st.expander("Rename / merge clusters"):
