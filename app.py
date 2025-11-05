@@ -595,14 +595,14 @@ if df_in is not None:
                         sizes = temp.groupby("parent")["keyword"].count().sort_values(ascending=False)
                         st.markdown(f"**Clusters:** {n_clusters} • **Avg size:** {sizes.mean():.2f} • **Median size:** {sizes.median():.0f}")
                         temp_friendly = temp.rename(columns=FRIENDLY_LABELS)
-                        st.dataframe(temp_friendly.head(500), use_container_width=True)
+st.dataframe(temp_friendly.head(500), use_container_width=True)
                         st.markdown("**Top clusters by size**")
-                        st.dataframe(sizes.head(20).to_frame("count"))
+st.dataframe(sizes.head(20).to_frame("count"))
 
                         use_friendly_csv = st.toggle("Use friendly headers in CSV", value=True, key=f"pf_csv_{thr}")
                         export_df = temp.rename(columns=FRIENDLY_LABELS) if use_friendly_csv else temp
                         csv = export_df.to_csv(index=False).encode("utf-8")
-                        st.download_button(f"⬇️ Download CSV (≥ {thr:.2f})", data=csv, file_name=f"keywords_clustered_polyfuzz_{thr:.2f}.csv", mime="text/csv")
+st.download_button(f"⬇️ Download CSV (≥ {thr:.2f})", data=csv, file_name=f"keywords_clustered_polyfuzz_{thr:.2f}.csv", mime="text/csv")
             else:
                 # Embedding/Vector path
                 def cluster_block(block: pd.DataFrame):
@@ -692,7 +692,7 @@ if df_in is not None:
                     insights_list = [ins]
 
                 # Friendly label display chooser
-                st.subheader("Label display")
+st.subheader("Label display")
                 friendly_options = [f"{v}" for v in LABEL_DISPLAY_OPTIONS.values()]
                 default_index = 0  # Primary Cluster Label
                 friendly_choice_label = st.radio("Choose which label to show as the cluster name",
@@ -719,7 +719,7 @@ if df_in is not None:
                 if X_main is not None:
                     try:
                         umap_xy = compute_umap_2d(X_main)
-                        st.subheader("Cluster map (UMAP 2D)")
+st.subheader("Cluster map (UMAP 2D)")
                         umap_df = pd.DataFrame({"x": umap_xy[:,0], "y": umap_xy[:,1], "label": df_view["core_label"].values})
                         st.scatter_chart(umap_df, x="x", y="y", color="label", height=400)
                     except Exception as e:
@@ -809,44 +809,44 @@ st.download_button(
 )
 st.subheader("🧰 Cluster Manager")
 
-                with st.expander("Rename / merge clusters"):
-                    labels_sorted = list(cluster_sizes.index)
-                    rename_from = st.selectbox("Cluster to rename/merge", labels_sorted if len(labels_sorted)>0 else ["<none>"])
-                    new_name = st.text_input("New name (existing name merges clusters)")
-                    if st.button("Apply rename/merge"):
+with st.expander("Rename / merge clusters"):
+labels_sorted = list(cluster_sizes.index)
+rename_from = st.selectbox("Cluster to rename/merge", labels_sorted if len(labels_sorted)>0 else ["<none>"])
+new_name = st.text_input("New name (existing name merges clusters)")
+if st.button("Apply rename/merge"):
                         if new_name:
-                            st.session_state.overrides["rename"][rename_from] = new_name
-                            st.success(f"Mapped '{rename_from}' → '{new_name}'")
+st.session_state.overrides["rename"][rename_from] = new_name
+st.success(f"Mapped '{rename_from}' → '{new_name}'")
 
-                with st.expander("Move specific keywords"):
-                    dest = st.selectbox("Move to label", list(cluster_sizes.index) if len(cluster_sizes)>0 else ["<none>"])
-                    src_label = st.selectbox("Filter keywords by cluster (optional)", ["<All>"] + list(cluster_sizes.index), index=0)
-                    if src_label == "<All>":
-                        kws_pool = df_view["keyword"].tolist()
+with st.expander("Move specific keywords"):
+dest = st.selectbox("Move to label", list(cluster_sizes.index) if len(cluster_sizes)>0 else ["<none>"])
+src_label = st.selectbox("Filter keywords by cluster (optional)", ["<All>"] + list(cluster_sizes.index), index=0)
+if src_label == "<All>":
+kws_pool = df_view["keyword"].tolist()
                     else:
-                        kws_pool = df_view.loc[df_view["core_label"] == src_label, "keyword"].tolist()
-                    selected_kws = st.multiselect("Select keywords to move", kws_pool)
-                    if st.button("Move selected keywords"):
-                        for kw in selected_kws:
-                            st.session_state.overrides["move"][kw] = dest
-                        st.success(f"Moved {len(selected_kws)} keywords → '{dest}'")
+kws_pool = df_view.loc[df_view["core_label"] == src_label, "keyword"].tolist()
+selected_kws = st.multiselect("Select keywords to move", kws_pool)
+if st.button("Move selected keywords"):
+for kw in selected_kws:
+st.session_state.overrides["move"][kw] = dest
+st.success(f"Moved {len(selected_kws)} keywords → '{dest}'")
 
-                with st.expander("Must-link / Cannot-link"):
-                    col1, col2 = st.columns(2)
+with st.expander("Must-link / Cannot-link"):
+col1, col2 = st.columns(2)
                     with col1:
-                        ml_a = st.text_input("Must-link A")
-                        ml_b = st.text_input("Must-link B")
-                        if st.button("Add must-link"):
+ml_a = st.text_input("Must-link A")
+ml_b = st.text_input("Must-link B")
+if st.button("Add must-link"):
                             if ml_a and ml_b:
-                                st.session_state.overrides["must_link"].append((ml_a, ml_b))
-                                st.success(f"Must-link added: {ml_a} ↔ {ml_b}")
+st.session_state.overrides["must_link"].append((ml_a, ml_b))
+st.success(f"Must-link added: {ml_a} ↔ {ml_b}")
                     with col2:
-                        cl_a = st.text_input("Cannot-link A")
-                        cl_b = st.text_input("Cannot-link B")
-                        if st.button("Add cannot-link"):
+cl_a = st.text_input("Cannot-link A")
+cl_b = st.text_input("Cannot-link B")
+if st.button("Add cannot-link"):
                             if cl_a and cl_b:
-                                st.session_state.overrides["cannot_link"].append((cl_a, cl_b))
-                                st.success(f"Cannot-link added: {cl_a} ⟂ {cl_b}")
+st.session_state.overrides["cannot_link"].append((cl_a, cl_b))
+st.success(f"Cannot-link added: {cl_a} ⟂ {cl_b}")
 
                 # Apply overrides live
                 def apply_overrides(df: pd.DataFrame, core_col: str = "core_label") -> pd.DataFrame:
@@ -881,23 +881,23 @@ st.subheader("🧰 Cluster Manager")
 
                 df_over = apply_overrides(df_view, core_col="core_label")
                 st.markdown("**After overrides (preview)**")
-                df_over_display = df_over.rename(columns=FRIENDLY_LABELS)
-                st.dataframe(df_over_display.head(1000), use_container_width=True)
+df_over_display = df_over.rename(columns=FRIENDLY_LABELS)
+st.dataframe(df_over_display.head(1000), use_container_width=True)
 
                 # Recompute top cluster sizes after overrides
-                cluster_sizes_over = df_over.groupby("core_label")["keyword"].count().sort_values(ascending=False)
+cluster_sizes_over = df_over.groupby("core_label")["keyword"].count().sort_values(ascending=False)
                 st.markdown("**Top clusters by size (after overrides)**")
-                st.dataframe(cluster_sizes_over.head(25).to_frame("count"))
+st.dataframe(cluster_sizes_over.head(25).to_frame("count"))
 
                 # Export / import overrides
-                ov_json = json.dumps(st.session_state.overrides, ensure_ascii=False, indent=2)
-                st.download_button("⬇️ Download overrides.json", data=ov_json, file_name="overrides.json", mime="application/json")
+ov_json = json.dumps(st.session_state.overrides, ensure_ascii=False, indent=2)
+st.download_button("⬇️ Download overrides.json", data=ov_json, file_name="overrides.json", mime="application/json")
 
-                uploaded_ov = st.file_uploader("Upload overrides.json", type=["json"], key="ov_json")
+uploaded_ov = st.file_uploader("Upload overrides.json", type=["json"], key="ov_json")
                 if uploaded_ov:
                     try:
-                        st.session_state.overrides = json.loads(uploaded_ov.read().decode("utf-8"))
-                        st.success("Overrides loaded.")
+st.session_state.overrides = json.loads(uploaded_ov.read().decode("utf-8"))
+st.success("Overrides loaded.")
                     except Exception as e:
                         st.error(f"Failed to load overrides: {e}")
 
@@ -909,14 +909,14 @@ st.subheader("🧰 Cluster Manager")
                 cols_show += ["cluster_url", "label_metric", "label_centroid", "label_tfidf"]
                 if cfg.parent_metric_col:
                     cols_show.append(cfg.parent_metric_col)
-                df_export = df_over[[c for c in cols_show if c in df_over.columns]].copy()
+df_export = df_over[[c for c in cols_show if c in df_over.columns]].copy()
                 if use_friendly_csv:
-                    df_export = df_export.rename(columns=FRIENDLY_LABELS)
+df_export = df_export.rename(columns=FRIENDLY_LABELS)
                 st.markdown("**Table (export preview)**")
-                st.dataframe(df_export.head(1000), use_container_width=True)
+st.dataframe(df_export.head(1000), use_container_width=True)
 
-                csv_final = df_export.to_csv(index=False).encode("utf-8")
-                st.download_button("⬇️ Download CSV", data=csv_final, file_name=f"keywords_clustered_{cfg.algorithm.lower()}_friendly.csv", mime="text/csv")
+csv_final = df_export.to_csv(index=False).encode("utf-8")
+st.download_button("⬇️ Download CSV", data=csv_final, file_name=f"keywords_clustered_{cfg.algorithm.lower()}_friendly.csv", mime="text/csv")
 
 st.markdown("---")
 st.caption("Built by Farky Rafiq | Plumbworld SEO: friendly names, robust import, multiple algorithms, URL-aware clustering, and human-in-the-loop controls.")
