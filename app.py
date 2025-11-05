@@ -758,7 +758,6 @@ def apply_overrides(df: pd.DataFrame, core_col: str = "core_label") -> pd.DataFr
 
     return out
 
-
 # ✅ Correct placement of preview and dedup fix
 df_over = apply_overrides(df_view, core_col="core_label")
 st.markdown("**After overrides (preview)**")
@@ -808,9 +807,7 @@ st.download_button(
     file_name=f"keywords_clustered_{cfg.algorithm.lower()}_friendly.csv",
     mime="text/csv"
 )
-
-                
-                st.subheader("🧰 Cluster Manager")
+st.subheader("🧰 Cluster Manager")
 
                 with st.expander("Rename / merge clusters"):
                     labels_sorted = list(cluster_sizes.index)
