@@ -49,7 +49,7 @@ except Exception:
 # ----------------------------------------------------------------------------
 
 # 🔧 Helper: Ensure no duplicate columns (PyArrow-safe)
-def remove_duplicate_columns(df):
+def remove_duplicate_columns(df: pd.DataFrame) -> pd.DataFrame:
     return df.loc[:, ~df.columns.duplicated()].copy()
 
 
@@ -580,6 +580,10 @@ if df_in is not None:
         st.warning(f"Selected URL column '{url_col_final}' not found in data. Skipping per-URL capping and URL grouping.")
         url_col_final = None
     if url_col_final:
+        df_work[url_col_final] = df_work$url_col_final.astype(str).str.strip()  # NOTE: this will be fixed below
+
+    # Fix the above line: pandas uses bracket indexing for dynamic columns
+    if url_col_final:
         df_work[url_col_final] = df_work[url_col_final].astype(str).str.strip()
 
     n_before = len(df_work)
@@ -620,7 +624,7 @@ if df_in is not None:
     # ------------------------------------------------------------------------
     if run_btn:
         with st.spinner("Clustering..."):
-            # -------------------------- POLYFUZZ PATH --------------------------
+            # -------------------------- POLYFUZ	z PATH --------------------------
             if cfg.algorithm == "PolyFuzz":
                 if PolyFuzz is None:
                     st.error("PolyFuzz is not installed. Add `polyfuzz` to requirements (e.g., `pip install polyfuzz`).")
@@ -661,7 +665,7 @@ if df_in is not None:
                         temp_friendly = remove_duplicate_columns(temp_friendly)
                         st.dataframe(temp_friendly.head(500), use_container_width=True)
 
-            st.markdown("**Top clusters by size**")
+                        st.markdown("**Top clusters by size**")
                         st.dataframe(sizes.head(20).to_frame("count"))
 
                         use_friendly_csv = st.toggle("Use friendly headers in CSV", value=True, key=f"pf_csv_{thr}")
