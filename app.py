@@ -1,4 +1,3 @@
-
 import io
 import json
 from dataclasses import dataclass, field
@@ -8,19 +7,19 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 
-# Optional dependencies (handled gracefully)
+# Optional dependency: chardet for encoding detection
 try:
     import chardet
 except Exception:
     chardet = None
 
-# Vectorization & ML
+# ML / vectorization
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.cluster import KMeans, AgglomerativeClustering
 from sklearn.metrics import silhouette_score
 
-# Optional algos
+# Optional algorithms
 try:
     import hdbscan
 except Exception:
@@ -45,22 +44,26 @@ except Exception:
 
 
 # ----------------------------------------------------------------------------
-# Streamlit page config
+# Streamlit config
 # ----------------------------------------------------------------------------
-
-# 🔧 Helper: Ensure no duplicate columns (PyArrow-safe)
-def remove_duplicate_columns(df):
-    return df.loc[:, ~df.columns.duplicated()].copy()
-
-
 st.set_page_config(page_title="Keyword Clustering (SEO)", page_icon="🔎", layout="wide")
 st.title("🔎 Keyword Clustering for SEO")
 st.caption("Friendly names • Robust import • Multiple algorithms • URL-aware clustering • Human-in-the-loop controls")
 
+# ----------------------------------------------------------------------------
+# Helpers
+# ----------------------------------------------------------------------------
+def remove_duplicate_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Ensure PyArrow can render without duplicate column names."""
+    return df.loc[:, ~df.columns.duplicated()].copy()
 
-# ----------------------------------------------------------------------------
-# Friendly labels & algorithm metadata
-# ----------------------------------------------------------------------------
+def safe_chardet_detect(b: bytes) -> str:
+    if chardet is None:
+        return "utf-8"
+    res = chardet.detect(b)
+    return res.get("encoding") or "utf-8"
+
+
 FRIENDLY_LABELS = {
     "label_metric": "Top Keyword by Performance",
     "label_centroid": "Central Topic Keyword",
@@ -101,77 +104,48 @@ ALGO_HELP = {
     "PolyFuzz (string match batches)": "Groups near-duplicate phrases by surface similarity. Ideal for cleanup/dedup.",
 }
 
-
 # ----------------------------------------------------------------------------
-# Persistent overrides state (Cluster Manager)
+# Overrides state
 # ----------------------------------------------------------------------------
 if "overrides" not in st.session_state:
-    st.session_state.overrides = {
-        "rename": {},        # {old_label -> new_label}
-        "move": {},          # {keyword -> dest_label}
-        "must_link": [],     # [(kw1, kw2), ...]
-        "cannot_link": [],   # [(kw1, kw2), ...]
-    }
-
+    st.session_state.overrides = {"rename": {}, "move": {}, "must_link": [], "cannot_link": []}
 
 # ----------------------------------------------------------------------------
 # Config dataclasses
 # ----------------------------------------------------------------------------
 @dataclass
 class IntentConfig:
-    info_pattern: str = (r"\\bwhat|where|why|when|who|how|which|guide|tutorial|tips|learn|"
-                         r"definition|meaning|best way|ideas|examples|vs\\b")
-    nav_pattern: str = (r"\\blogin|homepage|dashboard|pricing|contact|about|careers|"
-                        r"brand|official site|docs\\b")
-    trans_pattern: str = (r"\\bbuy|order|price|cost|deal|discount|sale|coupon|book|"
-                          r"download|trial|demo|quote|subscribe|signup|get started\\b")
-
+    info_pattern: str = (r"\bwhat|where|why|when|who|how|which|guide|tutorial|tips|learn|"
+                         r"definition|meaning|best way|ideas|examples|vs\b")
+    nav_pattern: str = (r"\blogin|homepage|dashboard|pricing|contact|about|careers|"
+                        r"brand|official site|docs\b")
+    trans_pattern: str = (r"\bbuy|order|price|cost|deal|discount|sale|coupon|book|"
+                          r"download|trial|demo|quote|subscribe|signup|get started\b")
 
 @dataclass
 class ClusterConfig:
-    # Representation
     representation: str = "SBERT (MiniLM)"
     sbert_model: str = "sentence-transformers/all-MiniLM-L6-v2"
-    # Algorithm
     algorithm: str = "HDBSCAN"  # KMeans, Agglomerative, HDBSCAN, Graph (Louvain), PolyFuzz
-    # Common options
     batch_thresholds: Tuple[float, ...] = (0.6, 0.7, 0.8)  # for PolyFuzz
-    k: int = 20  # KMeans clusters
+    k: int = 20
     distance_threshold: float = 0.25  # Agglomerative (cosine distance)
     hdb_min_cluster_size: int = 5
     hdb_min_samples: Optional[int] = None
     graph_sim_cutoff: float = 0.70
-    # Labeling
-    parent_strategy: str = "Highest metric"  # Highest metric / Centroid keyword / TF-IDF phrase / Longest / Shortest / Representative
+    parent_strategy: str = "Highest metric"
     parent_metric_col: Optional[str] = None
     tfidf_top_k: int = 2
-    # Columns
-    keyword_col_candidates: Tuple[str, ...] = (
-        "Keyword", "Keywords", "Query", "Queries", "Search term", "Search terms", "Term"
-    )
-    url_col_candidates: Tuple[str, ...] = (
-        "URL", "Page", "Page URL", "Landing Page", "Final URL", "Destination URL", "Canonical", "Slug"
-    )
-    impressions_col_candidates: Tuple[str, ...] = (
-        "Impressions", "Clicks", "Sessions", "Pageviews", "Volume", "Search Volume", "SV", "Traffic"
-    )
+    keyword_col_candidates: Tuple[str, ...] = ("Keyword", "Keywords", "Query", "Queries", "Search term", "Search terms", "Term")
+    url_col_candidates: Tuple[str, ...] = ("URL", "Page", "Page URL", "Landing Page", "Final URL", "Destination URL", "Canonical", "Slug")
+    impressions_col_candidates: Tuple[str, ...] = ("Impressions", "Clicks", "Sessions", "Pageviews", "Volume", "Search Volume", "SV", "Traffic")
     intent: IntentConfig = field(default_factory=IntentConfig)
-    # URL controls
     cluster_separately_by_url: bool = False
-    max_keywords_per_url: Optional[int] = None  # per-bucket cap
-
+    max_keywords_per_url: Optional[int] = None
 
 # ----------------------------------------------------------------------------
 # Robust file reading
 # ----------------------------------------------------------------------------
-def detect_encoding_from_bytes(b: bytes) -> str:
-    if chardet is None:
-        # Fallback if chardet isn't installed
-        return "utf-8"
-    res = chardet.detect(b)
-    return res.get("encoding") or "utf-8"
-
-
 def _try_read_csv(bytes_buf: bytes, *, encoding: str, sep, engine, on_bad_lines, quotechar, header, skiprows, thousands, decimal):
     return pd.read_csv(
         io.BytesIO(bytes_buf),
@@ -187,12 +161,11 @@ def _try_read_csv(bytes_buf: bytes, *, encoding: str, sep, engine, on_bad_lines,
         decimal=decimal if decimal else "."
     )
 
-
 def read_table_from_upload(f, *, delimiter_opt="Auto (detect)", quotechar='"', bad_line_behavior="error",
                            use_python_engine=True, header_row="Infer", skip_rows=0, thousands="", decimal=".") -> pd.DataFrame:
     name = f.name.lower()
     content = f.read()
-    encoding = detect_encoding_from_bytes(content)
+    encoding = safe_chardet_detect(content)
 
     header = "infer" if header_row == "Infer" else 0
     on_bad = None if bad_line_behavior == "error" else bad_line_behavior
@@ -200,15 +173,9 @@ def read_table_from_upload(f, *, delimiter_opt="Auto (detect)", quotechar='"', b
     if name.endswith((".xlsx", ".xls")):
         return pd.read_excel(io.BytesIO(content))
 
-    sep_map = {
-        "Auto (detect)": None,
-        ",": ",",
-        "\\t": "\\t",
-        ";": ";",
-        "|": "|"
-    }
+    sep_map = {"Auto (detect)": None, ",": ",", "\\t": "\t", ";": ";", "|": "|"}
     sep = sep_map.get(delimiter_opt, None)
-    candidates = [sep] if sep is not None else [None, ",", "\\t", ";", "|"]
+    candidates = [sep] if sep is not None else [None, ",", "\t", ";", "|"]
     engines = ["python"] if (use_python_engine or sep is None) else ["c", "python"]
 
     last_err = None
@@ -227,7 +194,6 @@ def read_table_from_upload(f, *, delimiter_opt="Auto (detect)", quotechar='"', b
     except Exception as e:
         raise ValueError(f"Failed to read file robustly. Last error: {last_err or e}")
 
-
 # ----------------------------------------------------------------------------
 # Column detection & normalization
 # ----------------------------------------------------------------------------
@@ -236,9 +202,8 @@ def _find_first(df: pd.DataFrame, candidates: Tuple[str, ...]) -> Optional[str]:
         return None
     lower_map = {c.lower(): c for c in df.columns}
     for cand in candidates:
-        lc = cand.lower()
-        if lc in lower_map:
-            return lower_map[lc]
+        if cand.lower() in lower_map:
+            return lower_map[cand.lower()]
     for cand in candidates:
         for c in df.columns:
             if cand.lower() in c.lower():
@@ -247,7 +212,6 @@ def _find_first(df: pd.DataFrame, candidates: Tuple[str, ...]) -> Optional[str]:
     if text_cols:
         return text_cols[0]
     return None
-
 
 def detect_columns(df: pd.DataFrame, cfg: ClusterConfig) -> Dict[str, Optional[str]]:
     key_col = _find_first(df, cfg.keyword_col_candidates)
@@ -265,10 +229,8 @@ def detect_columns(df: pd.DataFrame, cfg: ClusterConfig) -> Dict[str, Optional[s
                 break
     return {"keyword": key_col, "url": url_col, "metric": metric_col}
 
-
 def normalize_keywords(s: pd.Series) -> pd.Series:
-    return (s.astype(str).str.strip().str.replace(r"\\s+", " ", regex=True).str.lower())
-
+    return (s.astype(str).str.strip().str.replace(r"\s+", " ", regex=True).str.lower())
 
 # ----------------------------------------------------------------------------
 # Representations
@@ -279,50 +241,40 @@ def load_sbert(model_name: str):
         raise ImportError("sentence-transformers is required. Install it to use SBERT embeddings.")
     return SentenceTransformer(model_name)
 
-
 @st.cache_data(show_spinner=False)
 def embed_texts(texts: List[str], model_name: str) -> np.ndarray:
     model = load_sbert(model_name)
     return model.encode(texts, normalize_embeddings=True, show_progress_bar=False)
 
-
 def vectorize_tfidf(texts: List[str]) -> np.ndarray:
     vec = TfidfVectorizer(ngram_range=(1, 2), min_df=1)
     return vec.fit_transform(texts).toarray()
-
 
 # ----------------------------------------------------------------------------
 # Algorithms
 # ----------------------------------------------------------------------------
 def algo_kmeans(X: np.ndarray, k: int):
-    km = KMeans(n_clusters=k, n_init="auto", random_state=42)
+    km = KMeans(n_clusters=k, n_init=10, random_state=42)  # int for sklearn<=1.3
     labels = km.fit_predict(X)
     score = silhouette_score(X, labels) if len(set(labels)) > 1 else -1
     return labels, {"silhouette": float(score)}
 
-
 def algo_agglomerative(X: np.ndarray, distance_threshold: float):
+    # Precomputed cosine distance for compatibility
+    dist = 1.0 - cosine_similarity(X)
     model = AgglomerativeClustering(
-        n_clusters=None, metric="cosine", linkage="average",
-        distance_threshold=distance_threshold
+        n_clusters=None, affinity="precomputed", linkage="average", distance_threshold=distance_threshold
     )
-    labels = model.fit_predict(X)
+    labels = model.fit_predict(dist)
     return labels, {}
-
 
 def algo_hdbscan(X: np.ndarray, min_cluster_size: int, min_samples: Optional[int]):
     if hdbscan is None:
         raise ImportError("hdbscan is required. Install it to use HDBSCAN.")
-    cl = hdbscan.HDBSCAN(
-        metric="euclidean",
-        min_cluster_size=min_cluster_size,
-        min_samples=min_samples,
-        cluster_selection_epsilon=0.0
-    )
+    cl = hdbscan.HDBSCAN(metric="euclidean", min_cluster_size=min_cluster_size, min_samples=min_samples, cluster_selection_epsilon=0.0)
     labels = cl.fit_predict(X)
     meta = {"noise": int(np.sum(labels == -1))}
     return labels, meta
-
 
 def algo_graph_louvain(X: np.ndarray, sim_cutoff: float):
     if nx is None or community_louvain is None:
@@ -339,7 +291,6 @@ def algo_graph_louvain(X: np.ndarray, sim_cutoff: float):
     labels = np.array([parts[i] for i in range(X.shape[0])], dtype=int)
     return labels, {}
 
-
 @st.cache_data(show_spinner=False)
 def polyfuzz_match(keywords: List[str], model_name: str = "TF-IDF") -> pd.DataFrame:
     if PolyFuzz is None:
@@ -348,7 +299,6 @@ def polyfuzz_match(keywords: List[str], model_name: str = "TF-IDF") -> pd.DataFr
     model.match(keywords, keywords)
     m = model.get_matches().rename(columns={"From": "keyword", "To": "cluster_repr", "Similarity": "similarity"})
     return m
-
 
 # ----------------------------------------------------------------------------
 # Labeling helpers
@@ -364,7 +314,6 @@ def label_by_centroid(keywords: List[str], X: np.ndarray, labels: np.ndarray) ->
         out[int(lbl)] = keywords[idx[np.argmax(sims)]]
     return out
 
-
 def label_by_tfidf_phrase(keywords: List[str], labels: np.ndarray, top_k: int = 2) -> Dict[int, str]:
     out = {}
     for lbl in np.unique(labels):
@@ -378,7 +327,6 @@ def label_by_tfidf_phrase(keywords: List[str], labels: np.ndarray, top_k: int = 
         top = terms[tf.argsort()[::-1][:top_k]]
         out[int(lbl)] = " ".join(top)
     return out
-
 
 def label_by_metric(df: pd.DataFrame, labels: np.ndarray, metric_col: Optional[str]) -> Dict[int, str]:
     out: Dict[int, str] = {}
@@ -397,7 +345,6 @@ def label_by_metric(df: pd.DataFrame, labels: np.ndarray, metric_col: Optional[s
         else:
             out[int(lbl)] = sub["keyword"].iloc[0]
     return out
-
 
 # ----------------------------------------------------------------------------
 # Pipeline helpers
@@ -425,7 +372,6 @@ def stratified_cap_by_url(df: pd.DataFrame, url_col: Optional[str], cap: Optiona
         st.warning(f"Per-URL cap skipped due to: {e}")
         return df
 
-
 def build_representation_texts(keywords: List[str], cfg: ClusterConfig) -> np.ndarray:
     if cfg.representation == "TF-IDF":
         return vectorize_tfidf(keywords)
@@ -434,7 +380,6 @@ def build_representation_texts(keywords: List[str], cfg: ClusterConfig) -> np.nd
         return embed_texts(keywords, model)
     else:
         return vectorize_tfidf(keywords)
-
 
 def run_algo(X: np.ndarray, cfg: ClusterConfig):
     if cfg.algorithm == "KMeans":
@@ -448,7 +393,6 @@ def run_algo(X: np.ndarray, cfg: ClusterConfig):
     else:
         raise NotImplementedError(f"Algorithm '{cfg.algorithm}' not supported in run_algo().")
 
-
 def compute_umap_2d(X: np.ndarray, n_neighbors: int = 15, min_dist: float = 0.1) -> np.ndarray:
     try:
         import umap
@@ -457,13 +401,11 @@ def compute_umap_2d(X: np.ndarray, n_neighbors: int = 15, min_dist: float = 0.1)
     except Exception as e:
         raise RuntimeError(f"UMAP unavailable: {e}")
 
-
 def suggest_k(n_rows: int, desired_size: int) -> int:
     return max(2, int(round(n_rows / max(2, desired_size))))
 
-
 # ----------------------------------------------------------------------------
-# Sidebar UI
+# Sidebar
 # ----------------------------------------------------------------------------
 with st.sidebar:
     st.header("1) Data")
@@ -511,7 +453,6 @@ with st.sidebar:
     st.markdown("---")
     run_btn = st.button("🚀 Run clustering", type="primary", use_container_width=True)
 
-
 # ----------------------------------------------------------------------------
 # Load data
 # ----------------------------------------------------------------------------
@@ -544,7 +485,6 @@ elif uploaded is not None:
 else:
     df_in = None
 
-
 # ----------------------------------------------------------------------------
 # Main UI when data is present
 # ----------------------------------------------------------------------------
@@ -554,7 +494,6 @@ if df_in is not None:
     st.dataframe(df_in.head(20), use_container_width=True)
     st.caption(f"Columns detected: {list(df_in.columns)}")
 
-    # Detect columns and override controls
     cols_detect = detect_columns(df_in, ClusterConfig())
     with st.expander("Column mapping", expanded=False):
         st.write("Detected:", cols_detect)
@@ -567,7 +506,6 @@ if df_in is not None:
         metric_candidates = ["<Auto>"] + numeric_cols + [c for c in df_in.columns if c not in numeric_cols]
         metric_col = st.selectbox("Metric column (for 'Top Keyword by Performance')", options=metric_candidates, index=0)
 
-    # Normalize and cap per URL
     df_work = df_in.copy()
     if key_col not in df_work.columns:
         st.error("Selected keyword column not found in data.")
@@ -586,11 +524,9 @@ if df_in is not None:
     df_work = stratified_cap_by_url(df_work, url_col_final, cap_per_url)
     st.markdown(f"**Rows after per-URL cap:** {len(df_work):,} (from {n_before:,})")
 
-    # KMeans suggestion
     if algorithm_choice == "KMeans":
         st.caption(f"Suggested k ≈ {suggest_k(len(df_work), int(desired_avg))} (you set k={int(k_val)})")
 
-    # Build cfg
     cfg = ClusterConfig(
         representation=representation,
         algorithm="PolyFuzz" if algorithm_choice.startswith("PolyFuzz") else algorithm_choice,
@@ -606,7 +542,6 @@ if df_in is not None:
         max_keywords_per_url=int(cap_per_url)
     )
 
-    # PolyFuzz thresholds input
     poly_thr_text = None
     if algorithm_choice.startswith("PolyFuzz"):
         poly_thr_text = st.text_input("PolyFuzz thresholds (comma-separated)", "0.6,0.7,0.8")
@@ -615,15 +550,12 @@ if df_in is not None:
         except Exception:
             cfg.batch_thresholds = (0.6, 0.7, 0.8)
 
-    # ------------------------------------------------------------------------
-    # RUN BUTTON
-    # ------------------------------------------------------------------------
     if run_btn:
         with st.spinner("Clustering..."):
-            # -------------------------- POLYFUZZ PATH --------------------------
+            # -------------------------- POLYFuzz PATH --------------------------
             if cfg.algorithm == "PolyFuzz":
                 if PolyFuzz is None:
-                    st.error("PolyFuzz is not installed. Add `polyfuzz` to requirements (e.g., `pip install polyfuzz`).")
+                    st.error("PolyFuzz is not installed. Add `polyfuzz` to requirements.")
                     st.stop()
 
                 matches = polyfuzz_match(df_work["keyword"].tolist(), "TF-IDF")
@@ -638,10 +570,8 @@ if df_in is not None:
                         temp["_lbl"] = temp["cluster_repr"].astype("category").cat.codes
                         labels_metric = label_by_metric(temp.assign(keyword=temp["keyword"]), temp["_lbl"].values, metric_c)
                         temp["label_metric"] = temp["_lbl"].map(labels_metric)
-                        label_col_to_use = "label_metric" if cfg.parent_strategy == "Highest metric" else "parent_representative"
-                        temp["parent"] = temp[label_col_to_use]
+                        temp["parent"] = temp["label_metric"] if cfg.parent_strategy == "Highest metric" else temp["parent_representative"]
 
-                        # Canonical URL per cluster
                         if url_col_final and url_col_final in temp.columns:
                             canon = {}
                             for p, sub in temp.groupby("parent", sort=False):
@@ -657,8 +587,7 @@ if df_in is not None:
                         sizes = temp.groupby("parent")["keyword"].count().sort_values(ascending=False)
                         st.markdown(f"**Clusters:** {n_clusters} • **Avg size:** {sizes.mean():.2f} • **Median size:** {sizes.median():.0f}")
 
-                        temp_friendly = temp.rename(columns=FRIENDLY_LABELS)
-                        temp_friendly = remove_duplicate_columns(temp_friendly)
+                        temp_friendly = remove_duplicate_columns(temp.rename(columns=FRIENDLY_LABELS))
                         st.dataframe(temp_friendly.head(500), use_container_width=True)
 
                         st.markdown("**Top clusters by size**")
@@ -667,20 +596,19 @@ if df_in is not None:
                         use_friendly_csv = st.toggle("Use friendly headers in CSV", value=True, key=f"pf_csv_{thr}")
                         export_df = temp.rename(columns=FRIENDLY_LABELS) if use_friendly_csv else temp
                         csv = export_df.to_csv(index=False).encode("utf-8")
-                        st.download_button(
-                            f"⬇️ Download CSV (≥ {thr:.2f})",
-                            data=csv,
-                            file_name=f"keywords_clustered_polyfuzz_{thr:.2f}.csv",
-                            mime="text/csv",
-                        )
+                        st.download_button(f"⬇️ Download CSV (≥ {thr:.2f})", data=csv, file_name=f"keywords_clustered_polyfuzz_{thr:.2f}.csv", mime="text/csv")
 
-                # ✅ IMPORTANT — stop so classic clustering code does NOT run
                 st.stop()
 
             # ---------------------- CLASSIC ALGORITHMS PATH ----------------------
             def cluster_block(block: pd.DataFrame):
                 keywords = block["keyword"].tolist()
-                X = build_representation_texts(keywords, cfg)
+                if cfg.representation == "TF-IDF":
+                    X = vectorize_tfidf(keywords)
+                else:
+                    model_name = cfg.sbert_model if "MiniLM" in cfg.representation else "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+                    X = embed_texts(keywords, model_name)
+
                 labels, meta = run_algo(X, cfg)
                 out = block.copy()
                 out["_label"] = labels
@@ -689,10 +617,7 @@ if df_in is not None:
                 label_centroid = label_by_centroid(keywords, X, labels)
                 label_tfidf = label_by_tfidf_phrase(keywords, labels, top_k=cfg.tfidf_top_k)
 
-                # Longest/Shortest/Representative
-                label_long = {}
-                label_short = {}
-                label_repr = {}
+                label_long, label_short, label_repr = {}, {}, {}
                 for lbl in np.unique(labels):
                     idx = np.where(labels == lbl)[0]
                     kws = np.array(keywords)[idx]
@@ -725,7 +650,6 @@ if df_in is not None:
                 out["label_representative"] = out["_label"].map(label_repr)
                 out["parent"] = out["_label"].map(lambda x: pick(int(x)))
 
-                # URL canon
                 if url_col_final and url_col_final in out.columns:
                     canon = {}
                     for p, sub in out.groupby("parent", sort=False):
@@ -737,7 +661,6 @@ if df_in is not None:
                         canon[p] = u
                     out["cluster_url"] = out["parent"].map(canon)
 
-                # Insights
                 n_clusters = out["_label"].nunique()
                 sizes = out.groupby("parent")["keyword"].count().sort_values(ascending=False)
                 insights = {
@@ -748,8 +671,7 @@ if df_in is not None:
                 insights.update(meta)
                 return out, insights, X
 
-            outputs = []
-            insights_list = []
+            outputs, insights_list = [], []
             if cfg.cluster_separately_by_url and url_col_final:
                 for url_val, sub in df_work.groupby(url_col_final, dropna=False):
                     res, ins, _ = cluster_block(sub)
@@ -764,19 +686,15 @@ if df_in is not None:
                 df_out["url_bucket"] = df_out[url_col_final] if (url_col_final and url_col_final in df_out.columns) else None
                 insights_list = [ins]
 
-            # Friendly label display chooser
             st.subheader("Label display")
             friendly_options = [f"{v}" for v in LABEL_DISPLAY_OPTIONS.values()]
-            default_index = 0  # Primary Cluster Label
-            friendly_choice_label = st.radio("Choose which label to show as the cluster name",
-                                             friendly_options, horizontal=True, index=default_index)
+            friendly_choice_label = st.radio("Choose which label to show as the cluster name", friendly_options, horizontal=True, index=0)
             inv_map = {v: k for k, v in LABEL_DISPLAY_OPTIONS.items()}
             display_internal_col = inv_map[friendly_choice_label]
 
             df_view = df_out.copy()
             df_view["core_label"] = df_view[display_internal_col]
 
-            # Insights
             total_clusters = df_view["core_label"].nunique()
             cluster_sizes = df_view.groupby("core_label")["keyword"].count().sort_values(ascending=False)
             noise = next((i["noise"] for i in insights_list if "noise" in i), 0)
@@ -790,7 +708,6 @@ if df_in is not None:
                 + ("• " + " • ".join(extra) if extra else "")
             )
 
-            # UMAP (optional)
             if X_main is not None:
                 try:
                     umap_xy = compute_umap_2d(X_main)
@@ -800,9 +717,7 @@ if df_in is not None:
                 except Exception as e:
                     st.caption(f"(UMAP unavailable or failed: {e})")
 
-            # --- Cluster Manager (overrides) ---
             st.subheader("🧰 Cluster Manager")
-
             with st.expander("Rename / merge clusters"):
                 labels_sorted = list(cluster_sizes.index)
                 rename_from = st.selectbox("Cluster to rename/merge", labels_sorted if len(labels_sorted) > 0 else ["<none>"])
@@ -842,18 +757,14 @@ if df_in is not None:
                             st.session_state.overrides["cannot_link"].append((cl_a, cl_b))
                             st.success(f"Cannot-link added: {cl_a} ⟂ {cl_b}")
 
-            # Apply overrides live
             def apply_overrides(df: pd.DataFrame, core_col: str = "core_label") -> pd.DataFrame:
                 ov = st.session_state.overrides
                 out = df.copy()
-
                 if ov["rename"]:
                     out[core_col] = out[core_col].replace(ov["rename"])
-
                 if ov["move"]:
                     mask = out["keyword"].isin(ov["move"].keys())
                     out.loc[mask, core_col] = out.loc[mask, "keyword"].map(ov["move"])
-
                 for a, b in ov["must_link"]:
                     if a in set(out["keyword"]) and b in set(out["keyword"]):
                         la = out.loc[out["keyword"] == a, core_col].iloc[0]
@@ -862,7 +773,6 @@ if df_in is not None:
                         size_b = (out[core_col] == lb).sum()
                         target = la if size_a >= size_b else lb
                         out.loc[out["keyword"].isin([a, b]), core_col] = target
-
                 for a, b in ov["cannot_link"]:
                     if a in set(out["keyword"]) and b in set(out["keyword"]):
                         la = out.loc[out["keyword"] == a, core_col].iloc[0]
@@ -870,21 +780,17 @@ if df_in is not None:
                         if la == lb:
                             new_label = f"{lb} (split)"
                             out.loc[out["keyword"] == b, core_col] = new_label
-
                 return out
 
             df_over = apply_overrides(df_view, core_col="core_label")
             st.markdown("**After overrides (preview)**")
-            df_over_display = df_over.rename(columns=FRIENDLY_LABELS)
-            df_over_display = remove_duplicate_columns(df_over_display)
-        st.dataframe(df_over_display.head(1000), use_container_width=True)
+            df_over_display = remove_duplicate_columns(df_over.rename(columns=FRIENDLY_LABELS))
+            st.dataframe(df_over_display.head(1000), use_container_width=True)
 
-            # Recompute top cluster sizes after overrides
             cluster_sizes_over = df_over.groupby("core_label")["keyword"].count().sort_values(ascending=False)
             st.markdown("**Top clusters by size (after overrides)**")
             st.dataframe(cluster_sizes_over.head(25).to_frame("count"))
 
-            # Export / import overrides
             ov_json = json.dumps(st.session_state.overrides, ensure_ascii=False, indent=2)
             st.download_button("⬇️ Download overrides.json", data=ov_json, file_name="overrides.json", mime="application/json")
 
@@ -896,7 +802,6 @@ if df_in is not None:
                 except Exception as e:
                     st.error(f"Failed to load overrides: {e}")
 
-            # Downloads with friendly headers option
             use_friendly_csv = st.toggle("Use friendly headers in CSV", value=True)
             cols_show = ["keyword", "core_label", "_label"]
             if url_col_final:
