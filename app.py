@@ -661,7 +661,7 @@ if df_in is not None:
                         temp_friendly = remove_duplicate_columns(temp_friendly)
                         st.dataframe(temp_friendly.head(500), use_container_width=True)
 
-                        st.markdown("**Top clusters by size**")
+            st.markdown("**Top clusters by size**")
                         st.dataframe(sizes.head(20).to_frame("count"))
 
                         use_friendly_csv = st.toggle("Use friendly headers in CSV", value=True, key=f"pf_csv_{thr}")
@@ -877,7 +877,7 @@ if df_in is not None:
             st.markdown("**After overrides (preview)**")
             df_over_display = df_over.rename(columns=FRIENDLY_LABELS)
             df_over_display = remove_duplicate_columns(df_over_display)
-        st.dataframe(df_over_display.head(1000), use_container_width=True)
+            st.dataframe(df_over_display.head(1000), use_container_width=True)
 
             # Recompute top cluster sizes after overrides
             cluster_sizes_over = df_over.groupby("core_label")["keyword"].count().sort_values(ascending=False)
