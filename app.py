@@ -49,7 +49,7 @@ except Exception:
 # ----------------------------------------------------------------------------
 
 # 🔧 Helper: Ensure no duplicate columns (PyArrow-safe)
-def remove_duplicate_columns(df: pd.DataFrame) -> pd.DataFrame:
+def remove_duplicate_columns(df):
     return df.loc[:, ~df.columns.duplicated()].copy()
 
 
@@ -580,10 +580,6 @@ if df_in is not None:
         st.warning(f"Selected URL column '{url_col_final}' not found in data. Skipping per-URL capping and URL grouping.")
         url_col_final = None
     if url_col_final:
-        df_work[url_col_final] = df_work$url_col_final.astype(str).str.strip()  # NOTE: this will be fixed below
-
-    # Fix the above line: pandas uses bracket indexing for dynamic columns
-    if url_col_final:
         df_work[url_col_final] = df_work[url_col_final].astype(str).str.strip()
 
     n_before = len(df_work)
@@ -624,7 +620,7 @@ if df_in is not None:
     # ------------------------------------------------------------------------
     if run_btn:
         with st.spinner("Clustering..."):
-            # -------------------------- POLYFUZ	z PATH --------------------------
+            # -------------------------- POLYFUZZ PATH --------------------------
             if cfg.algorithm == "PolyFuzz":
                 if PolyFuzz is None:
                     st.error("PolyFuzz is not installed. Add `polyfuzz` to requirements (e.g., `pip install polyfuzz`).")
@@ -881,7 +877,7 @@ if df_in is not None:
             st.markdown("**After overrides (preview)**")
             df_over_display = df_over.rename(columns=FRIENDLY_LABELS)
             df_over_display = remove_duplicate_columns(df_over_display)
-            st.dataframe(df_over_display.head(1000), use_container_width=True)
+        st.dataframe(df_over_display.head(1000), use_container_width=True)
 
             # Recompute top cluster sizes after overrides
             cluster_sizes_over = df_over.groupby("core_label")["keyword"].count().sort_values(ascending=False)
