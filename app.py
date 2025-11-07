@@ -47,6 +47,12 @@ except Exception:
 # ----------------------------------------------------------------------------
 # Streamlit page config
 # ----------------------------------------------------------------------------
+
+# 🔧 Helper: Ensure no duplicate columns (PyArrow-safe)
+def remove_duplicate_columns(df):
+    return df.loc[:, ~df.columns.duplicated()].copy()
+
+
 st.set_page_config(page_title="Keyword Clustering (SEO)", page_icon="🔎", layout="wide")
 st.title("🔎 Keyword Clustering for SEO")
 st.caption("Friendly names • Robust import • Multiple algorithms • URL-aware clustering • Human-in-the-loop controls")
@@ -544,6 +550,7 @@ else:
 # ----------------------------------------------------------------------------
 if df_in is not None:
     st.subheader("Preview input")
+    df_in = remove_duplicate_columns(df_in)
     st.dataframe(df_in.head(20), use_container_width=True)
     st.caption(f"Columns detected: {list(df_in.columns)}")
 
@@ -651,6 +658,7 @@ if df_in is not None:
                         st.markdown(f"**Clusters:** {n_clusters} • **Avg size:** {sizes.mean():.2f} • **Median size:** {sizes.median():.0f}")
 
                         temp_friendly = temp.rename(columns=FRIENDLY_LABELS)
+                        temp_friendly = remove_duplicate_columns(temp_friendly)
                         st.dataframe(temp_friendly.head(500), use_container_width=True)
 
                         st.markdown("**Top clusters by size**")
@@ -868,7 +876,8 @@ if df_in is not None:
             df_over = apply_overrides(df_view, core_col="core_label")
             st.markdown("**After overrides (preview)**")
             df_over_display = df_over.rename(columns=FRIENDLY_LABELS)
-            st.dataframe(df_over_display.head(1000), use_container_width=True)
+            df_over_display = remove_duplicate_columns(df_over_display)
+        st.dataframe(df_over_display.head(1000), use_container_width=True)
 
             # Recompute top cluster sizes after overrides
             cluster_sizes_over = df_over.groupby("core_label")["keyword"].count().sort_values(ascending=False)
@@ -899,6 +908,7 @@ if df_in is not None:
             if use_friendly_csv:
                 df_export = df_export.rename(columns=FRIENDLY_LABELS)
             st.markdown("**Table (export preview)**")
+            df_export = remove_duplicate_columns(df_export)
             st.dataframe(df_export.head(1000), use_container_width=True)
 
             csv_final = df_export.to_csv(index=False).encode("utf-8")
