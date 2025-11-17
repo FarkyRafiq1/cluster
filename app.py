@@ -46,15 +46,15 @@ FRIENDLY_LABELS = {
     "label_metric": "Top Keyword by Performance",
     "label_centroid": "Central Topic Keyword",
     "label_tfidf": "Descriptive Topic Name",
-    "label_longest": "Detailed / Long-Tail Term",
-    "label_shortest": "Broad / Head Term",
+    "label_longest": "Detailed Long-Tail Term",
+    "label_shortest": "Broad Head Term",
     "label_representative": "Representative Keyword",
     "parent": "Primary Cluster Label",
     "cluster_url": "Canonical Page (Ranked URL)",
     "url_bucket": "Original URL Group",
     "core_label": "Displayed Cluster Name",
-    "_label": "Cluster ID (Internal)",
-    "keyword": "Keyword",
+    "_label": "Cluster ID Internal",
+    "keyword": "Keyword Original"
 }
 
 LABEL_DISPLAY_OPTIONS = {
